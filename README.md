@@ -97,8 +97,9 @@ permission, stats), `talk.swift` (the `--talk` words, through nospeaker's voice 
 ## Tested on
 
 ```
-MacBook Pro 14" (MacBookPro18,3)   M1 Pro   macOS 27.0.1   trackpad clicks on real keys ✓
+MacBook Pro 14" (MacBookPro18,3)   M1 Pro   macOS 27.0.1   177 real keystrokes → clicks ✓ (5 keys/s, 12 throttled)
 nospeaker (upstream show)          still builds and talks from the split engine        ✓
+Input Monitoring grant             survives rebuilds with a new cdhash (signed id)     ✓
 ```
 
 Not tested: Intel Macs, Magic Trackpad, other macOS versions — same caveats as upstream, since it's the

@@ -195,8 +195,10 @@ func runThockpad() -> Int32 {
                            : "  keys are SWALLOWED — nothing you type reaches the Mac. Ctrl-C takes the keyboard back.")
     }
 
-    // Sleep in short pieces so ctrl-c (which only sets a flag in the handler) ends it promptly.
-    while !stopRequested { usleep(50_000) }
+    // Pump this thread's run loop: the event tap's callback fires from it, so a plain sleep loop here means
+    // the tap never delivers a single key (silent, zero presses — it looks like the tap is dead). Short
+    // slices so ctrl-c, which only sets a flag in the handler, ends it promptly.
+    while !stopRequested { CFRunLoopRunInMode(.defaultMode, 0.05, false) }
     printStatus()
     if let motor { _ = actuatorClose?(motor) }
     return 0
