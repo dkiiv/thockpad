@@ -44,13 +44,14 @@ let profiles: [String: Profile] = Dictionary(uniqueKeysWithValues: profileList.m
 /// Menu order (and what --cycle walks), the way they are described in --list.
 let profileOrder = profileList.map(\.name)
 
-// MARK: - Settings (set from main.swift before runThockpad)
+// MARK: - Settings (set from main.swift or the GUI; read per keystroke)
 
 var profileName = "thock"
 var currentProfile = profiles["thock"]!
 var gain: Float = 0.85          // overall click loudness (motor is never driven past its normal maximum)
-var releaseGain: Float = 1      // --no-release sets this to 0
-var passThrough = true          // false = swallow key events (--swallow, testing only)
+var releaseOn = true            // the bottom-out “tock” on key-up
+var passThrough = true          // false = swallow key events (--swallow / the GUI checkbox)
+var paused = false              // the GUI's pause: the tap keeps running, nothing clicks, keys stay normal
 var throttleSeconds = 0.015     // actuations can't overlap: 15 ms is the floor for a clean click
 var talkEnabled = false
 var verbose = false
@@ -60,6 +61,7 @@ var chatter = false
 func report(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
 func setProfile(_ name: String) { profileName = name; currentProfile = profiles[name]! }
+var swallowKeys: Bool { get { !passThrough } set { passThrough = !newValue } }
 
 /// Startup chatter only (--chatter / --verbose): the daemon must be silent without it.
 func say(_ s: String) { if chatter { report(s) } }
@@ -95,6 +97,6 @@ func clickTones(for code: Int, at t: Double) -> [Tone] {
 
 /// The release "tock": the same click, a bit lower and much quieter.
 func releaseTones() -> [Tone] {
-    guard currentProfile.release > 0, releaseGain > 0 else { return [] }
+    guard releaseOn, currentProfile.release > 0 else { return [] }
     return currentProfile.tones.map { Tone(hz: $0.hz * 0.82, amp: $0.amp * 0.6, ms: $0.ms, delay: $0.delay) }
 }

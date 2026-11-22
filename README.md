@@ -12,43 +12,59 @@ device. One or two sine tones, a few milliseconds each, straight to the motor.
         ┌────────────┐   CGEventTap   ┌────────────┐   MultitouchSupport   ┌─────────┐
 keys ──▶│ your Mac   │───────────────▶│ thockpad   │──────────────────────▶│ motor   │──▶ thock
         └────────────┘  key down/up   │ 15 ms gate │   2 tones / click     └─────────┘
-                                      └────────────┘
 ```
 
-```
-[ mute your mac ]        it still clicks; that's the point
-[ on a table ]           on your lap it's much quieter
-```
+## Download
+
+**The compiled app lives in [Releases →](https://github.com/dkiiv/thockpad/releases/latest)** —
+download `Thockpad.zip`, unzip, and open **Thockpad.app**.
+
+> The build is signed ad-hoc (no Apple Developer ID), so macOS won't open it with a double-click the first
+> time: **right-click the app → Open → Open**. That's a one-time thing for this build.
+> Needs an Apple Silicon MacBook with a Force Touch trackpad (2015+) on macOS 12 or newer.
 
 ## Run it
 
+Open **Thockpad.app**. A window appears and your next keystroke clicks.
+
+- **The red X does not quit.** The window closes, the Dock icon disappears, and thockpad keeps clicking
+  from the **menu bar** (a small keyboard icon, top right). Open the menu there to switch profiles, set the
+  level, pause, or **Exit thockpad** — the only way it stops.
+- The first launch asks for **Input Monitoring**: allow it in the System Settings pane that opens, then
+  *Restart thockpad* from the menu bar item (a fresh grant only applies to a new process).
+- Everything you set is remembered for the next launch.
+- Mute the Mac — the sound comes out of the trackpad glass. On a table it's much louder than on your lap.
+
+From source:
+
 ```sh
-./build.sh                # builds ./build/thockpad (and ./build/nospeaker, the fork's parent)
-./build/thockpad          # start clicking (silent start — just type)
+git clone https://github.com/dkiiv/thockpad
+cd thockpad
+./build.sh                # builds ./build/thockpad, ./build/nospeaker, ./build/Thockpad.app
+open build/Thockpad.app   # or right-click → Open the first time
 ```
 
-macOS asks for **Input Monitoring** the first time: allow it in System Settings → Privacy & Security →
-Input Monitoring, then start thockpad again (a fresh grant only applies to a new process). `./build.sh`
-signs each build with a stable identifier (`com.dkiiv.thockpad`) so the grant survives recompiling —
-without that, every rebuild asks again. `./scripts/permissions.sh --check` tells you where you stand.
+## The CLI
 
-## Play with it
+The same engine without a window, for scripts and testing:
 
 ```sh
-./build/thockpad --list                # the click profiles
-./build/thockpad --profile blue        # clicky: bright snap
-./build/thockpad --profile thock       # deep marbly thock (the default)
-./build/thockpad --level 0.6           # quieter clicks
-./build/thockpad --no-release          # no bottom-out tock on key-up
-./build/thockpad --talk                # it says a word on space, "done" on return (via nospeaker)
-./build/thockpad --verbose             # print each key as it clicks
-./build/thockpad --swallow             # your real typing goes nowhere, only clicks (testing!)
-./build/thockpad --selftest            # one synthetic keypress, proves the click loop
-./build/thockpad --run 60              # quit by itself after 60 s and print stats
+./build/thockpad --cli                    # click in the terminal until ctrl-c
+./build/thockpad --list                   # the click profiles
+./build/thockpad --profile blue           # pick one
+./build/thockpad --level 0.6              # quieter
+./build/thockpad --no-release             # no bottom-out tock
+./build/thockpad --talk                   # says a word on space, "done" on return (via nospeaker)
+./build/thockpad --swallow                # your real typing goes nowhere, only clicks (testing!)
+./build/thockpad --verbose --chatter      # print each key + startup line
+./build/thockpad --selftest               # one synthetic keypress, proves the click loop
+./build/thockpad --run 60                 # quit by itself after 60 s and print stats
+./build/nospeaker "hello"                 # the parent project: the trackpad talks
 ```
 
-Ctrl-C stops it. `kill -USR1 <pid>` prints how you're doing (presses, releases, keys/second).
-It starts and runs **silently**: no startup sound, no terminal chatter unless you ask for it.
+Ctrl-C stops the CLI; `kill -USR1 <pid>` prints how you're doing (presses, releases, keys/second).
+Both modes start **silently**: no startup sound, no terminal chatter unless you ask for it.
+Flags override saved GUI settings; without flags the binary opens the app.
 
 ## How a click is made
 
@@ -92,12 +108,17 @@ Two engineering notes:
    20-line two-file case; eager init from the entry point works.
 
 thockpad's own files: `clicks.swift` (profiles, tone math, `playClick`), `keys.swift` (event tap,
-permission, stats), `talk.swift` (the `--talk` words, through nospeaker's voice engine).
+permission, stats), `talk.swift` (the `--talk` words, through nospeaker's voice engine),
+`settings.swift` (remembered settings) and `gui.swift` (the window and the menu bar item — plain AppKit, no
+Xcode project; `scripts/make-app.sh` wraps the binary into `Thockpad.app`, and `scripts/release.sh`
+publishes it to Releases).
 
 ## Tested on
 
 ```
 MacBook Pro 14" (MacBookPro18,3)   M1 Pro   macOS 27.0.1   177 real keystrokes → clicks ✓ (5 keys/s, 12 throttled)
+the app (window + menu bar)        close → menu bar, Try a click → 2 actuations ✓, Exit → quit ✓
+settings you change                persist to disk and reload ✓
 nospeaker (upstream show)          still builds and talks from the split engine        ✓
 Input Monitoring grant             survives rebuilds with a new cdhash (signed id)     ✓
 ```
@@ -106,12 +127,23 @@ Not tested: Intel Macs, Magic Trackpad, other macOS versions — same caveats as
 same private `MultitouchSupport` calls. If it doesn't work on your Mac, upstream's issue tracker is
 probably the place anyway.
 
+## Building a release
+
+```sh
+VERSION=1.0 ./scripts/release.sh     # builds, bundles, zips, uploads Thockpad.zip to the GitHub release
+```
+
+It needs a GitHub token with repo access (from `GH_TOKEN` or your git credential store). The app is ad-hoc
+signed with the stable identifier `com.dkiiv.thockpad`; notarization (a Developer ID) is a possible
+upgrade that would remove the right-click→Open step for downloaded builds.
+
 ## Caveats
 
 - `MultitouchSupport` is private and undocumented; a macOS update can break this. (Upstream's caveat,
   inherited whole.)
-- thockpad needs Input Monitoring. It runs in the background and stores nothing; the stats are printed on
-  request and live in memory only.
+- thockpad needs Input Monitoring to hear the keyboard. It stores only the settings you set in the window
+  (profile, level, tocks, talk, swallow, paused) in `~/Library/Preferences/com.dkiiv.thockpad.settings.plist`;
+  keystrokes and stats live in memory only.
 - The motor is never driven past its normal maximum strength — same rule as upstream.
 
 ## License

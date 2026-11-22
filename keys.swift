@@ -7,6 +7,8 @@
 //
 // Needs Input Monitoring (Accessibility): macOS prompts on first run, and a fresh grant only applies to a
 // newly started process.
+//
+// The GUI drives the same functions (startTap/stopTap/motorCheck); runThockpad() is the CLI's loop.
 
 import AppKit
 import CoreGraphics
@@ -49,8 +51,14 @@ func enqueue(_ click: Click) {
     clickSemaphore.signal()
 }
 
+var workerStarted = false
+let workerLock = NSLock()
+
 /// The worker thread: play one whole click at a time, honouring each tone's offset inside it.
-func startClickWorker() {
+func startClickWorkerIfNeeded() {
+    workerLock.lock(); defer { workerLock.unlock() }
+    guard !workerStarted else { return }
+    workerStarted = true
     Thread {
         while !stopRequested {
             clickSemaphore.wait()
@@ -74,9 +82,51 @@ struct Stats {
 let statsLock = NSLock()
 var stats = Stats()
 
+// MARK: - The motor, checked without exiting
+
+/// Why the trackpad can't click, or nil when it can. openMotor() (from nospeaker) explains problems well
+/// but exits the process — right for the CLI, wrong for a GUI window, so this mirrors its probe and reports
+/// instead of exiting. Opens the actuator as a side effect.
+func motorCheck() -> String? {
+    if motor != nil { return nil }
+    guard createList != nil, getID != nil, isBuiltIn != nil, actuatorCreate != nil, actuatorOpen != nil,
+          actuationCreate != nil, actuationPlay != nil else {
+        return "This version of macOS doesn't have the trackpad functions thockpad needs."
+    }
+    guard let list = createList?()?.takeRetainedValue(), CFArrayGetCount(list) > 0 else {
+        return "No trackpad found. thockpad needs a Force Touch trackpad (a MacBook from 2015 on, or a Magic Trackpad 2 or newer)."
+    }
+    deviceList = list
+    var ids: [(id: UInt64, builtIn: Bool)] = []
+    for i in 0..<CFArrayGetCount(list) {
+        guard let raw = CFArrayGetValueAtIndex(list, i) else { continue }
+        let dev = UnsafeMutableRawPointer(mutating: raw)
+        var id: UInt64 = 0
+        if getID!(dev, &id) == 0 { ids.append((id, isBuiltIn?(dev) ?? false)) }
+    }
+    for d in ids.sorted(by: { $0.builtIn && !$1.builtIn }) {
+        if let ref = actuatorCreate!(d.id)?.takeRetainedValue(), actuatorOpen!(ref) == 0 {
+            motorDeviceID = d.id
+            motorBuiltIn = d.builtIn
+            motor = ref
+            motorPointer = Unmanaged.passUnretained(ref as AnyObject).toOpaque()
+            return nil
+        }
+    }
+    return "Found a trackpad, but it has no haptic motor (Force Touch), so it can't click."
+}
+
+/// nil when the motor is open and ready; sets motorProblem so callers (and the GUI) can say why not.
+var motorProblem: String?
+func openMotorIfNeeded() {
+    if motor == nil { motorProblem = motorCheck() }
+}
+
 // MARK: - The tap
 
 var eventTap: CFMachPort?
+var tapSource: CFRunLoopSource?
+var tapRunning: Bool { eventTap != nil }
 var lastClickAt = -1.0
 
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
@@ -85,7 +135,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
     }
-    guard !stopRequested else { return Unmanaged.passUnretained(event) }
+    guard !stopRequested, !paused else { return Unmanaged.passUnretained(event) }
 
     let t = now()
     switch type {
@@ -114,7 +164,7 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
         let tones = releaseTones()
         guard !tones.isEmpty else { return Unmanaged.passUnretained(event) }
         if verbose { report("↑") }
-        enqueue(Click(tones: tones, level: gain * Float(currentProfile.release) * releaseGain))
+        enqueue(Click(tones: tones, level: gain * Float(currentProfile.release)))
         statsLock.lock(); stats.up += 1; statsLock.unlock()
         return Unmanaged.passUnretained(event)
 
@@ -123,12 +173,45 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     }
 }
 
+/// Create the tap, add it to this thread's run loop (its callback fires from there), and enable it.
+func startTap() -> Bool {
+    guard eventTap == nil else { return true }
+    let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                      options: passThrough ? .listenOnly : .defaultTap,
+                                      eventsOfInterest: mask, callback: tapCallback, userInfo: nil) else {
+        return false
+    }
+    eventTap = tap
+    tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    return true
+}
+
+func stopTap() {
+    guard let tap = eventTap else { return }
+    CGEvent.tapEnable(tap: tap, enable: false)
+    if let source = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+    eventTap = nil
+    tapSource = nil
+}
+
 // MARK: - Input Monitoring
 
-/// Stop with instructions unless macOS already trusts this binary. AXIsProcessTrustedWithOptions prompts the
-/// first time; the grant only takes effect in a new process, so thockpad has to exit.
+func inputMonitoringGranted() -> Bool { AXIsProcessTrusted() }
+
+func openInputMonitoringPane() {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    task.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]
+    try? task.run()
+}
+
+/// Exit with instructions unless macOS already trusts this binary (CLI path; the GUI shows the same text in
+/// its window instead). A fresh grant only applies to a new process, so the current one is useless.
 func requireInputMonitoring() {
-    if AXIsProcessTrusted() { return }
+    if inputMonitoringGranted() { return }
     let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
     _ = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
     report("""
@@ -142,10 +225,7 @@ func requireInputMonitoring() {
       If it's in the list, ticked, and still not working: the binary changed since you ticked it
       (a rebuild, or a different copy). Run ./scripts/permissions.sh to give it a stable identity.
     """)
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    task.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]
-    try? task.run()
+    openInputMonitoringPane()
     exit(77)
 }
 
@@ -155,37 +235,25 @@ func printStatus() {
     statsLock.lock(); let s = stats; statsLock.unlock()
     let rate = s.active > 0 ? Double(s.down) / s.active : 0
     report("""
-    thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(talkEnabled ? " · talking" : "")\(passThrough ? "" : " · SWALLOWING KEYS")
+    thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(talkEnabled ? " · talking" : "")\(passThrough ? "" : " · SWALLOWING KEYS")\(paused ? " · PAUSED" : "")
     \(s.down) presses, \(s.up) releases, \(s.throttled) too fast, \(s.spoken) words · \(String(format: "%.1f", rate)) keys/second
     ctrl-c stops it (or kill -USR1 \(getpid()) prints this).
     """)
 }
 
-// MARK: - Running
-
-func openMotorIfNeeded() {
-    if motor == nil {
-        motor = openMotor()
-        motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
-    }
-}
+// MARK: - Running (CLI)
 
 func runThockpad() -> Int32 {
     openMotorIfNeeded()
+    if let problem = motorProblem { report("thockpad: \(problem)"); return 2 }
     requireInputMonitoring()
     warmVoice()   // synthesise the word bank up front, so the first space bar is not slow
 
-    let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
-    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                      options: passThrough ? .listenOnly : .defaultTap,
-                                      eventsOfInterest: mask, callback: tapCallback, userInfo: nil) else {
+    guard startTap() else {
         report("thockpad couldn't open the keyboard tap. Quit any other thockpad and start it again; if that fails, ./scripts/permissions.sh")
         return 1
     }
-    eventTap = tap
-    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    startClickWorker()
+    startClickWorkerIfNeeded()
     installExitSignals()
 
     // Silent by design: no click, no greeting — you will hear it when you type.
@@ -223,21 +291,13 @@ func startTimer(_ seconds: Double) {
 /// also why thockpad listens at the session tap.
 func selfTest() -> Int32 {
     openMotorIfNeeded()
-    if !AXIsProcessTrusted() {
+    if let problem = motorProblem { report("self-test: \(problem)"); return 2 }
+    if !inputMonitoringGranted() {
         report("self-test: not trusted yet — allow thockpad under Input Monitoring, then run it again (exit 3).")
         return 3
     }
-    let mask: CGEventMask = 1 << CGEventType.keyDown.rawValue
-    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                      options: .listenOnly, eventsOfInterest: mask,
-                                      callback: tapCallback, userInfo: nil) else {
-        report("self-test: trusted, but the tap wouldn't open (exit 3).")
-        return 3
-    }
-    eventTap = tap
-    CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0), .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    startClickWorker()
+    guard startTap() else { report("self-test: trusted, but the tap wouldn't open (exit 3)."); return 3 }
+    startClickWorkerIfNeeded()
 
     statsLock.lock(); let before = stats.down; statsLock.unlock()
     let src = CGEventSource(stateID: .privateState)

@@ -27,7 +27,7 @@ set -- $version
 
 mkdir -p build
 ENGINE="nospeaker/engine.swift"
-THOCK="clicks.swift keys.swift talk.swift main.swift"
+THOCK="clicks.swift keys.swift talk.swift settings.swift gui.swift main.swift"
 
 build_for() {   # build_for <target> <out-suffix> [extra swiftc flags…]
     target="$1"; suffix="$2"; shift 2
@@ -60,5 +60,10 @@ esac
 codesign --force --sign - --identifier com.dkiiv.thockpad build/thockpad 2>/dev/null || true
 codesign --force --sign - --identifier com.dkiiv.nospeaker build/nospeaker 2>/dev/null || true
 
-printf '\n  built ./build/thockpad (%s) and ./build/nospeaker (%s)\n' "$(lipo -archs build/thockpad)" "$(lipo -archs build/nospeaker)"
-printf '  try: ./build/thockpad --selftest   then   ./build/thockpad\n'
+# The app bundle around the thockpad binary (Info.plist + stable signature), so `open build/Thockpad.app`
+# works straight after a build; ./scripts/make-app.sh --zip adds dist/*.zip for a GitHub release.
+./scripts/make-app.sh
+
+printf '\n  built ./build/thockpad + ./build/Thockpad.app (%s) and ./build/nospeaker (%s)\n' "$(lipo -archs build/thockpad)" "$(lipo -archs build/nospeaker)"
+printf '  open the app:  open build/Thockpad.app      (right-click → Open the first time)\n'
+printf '  or the CLI:    ./build/thockpad --selftest  then  ./build/thockpad --cli\n'
