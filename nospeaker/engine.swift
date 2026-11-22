@@ -34,10 +34,20 @@ var inCredits = false
 func requestEnd() { if inCredits || jumpToCredits { stopRequested = true } else { jumpToCredits = true } }
 func interrupted() -> Bool { stopRequested || skipRequested || jumpToCredits }
 
-var timebase = mach_timebase_info_data_t()
-mach_timebase_info(&timebase)
-let ticksPerSecond = 1e9 * Double(timebase.denom) / Double(timebase.numer)
-let t0 = mach_absolute_time()
+// Upstream is one file, so its clock globals are initialised in file order:
+//     var timebase = mach_timebase_info_data_t(); mach_timebase_info(&timebase)
+//     let ticksPerSecond = …; let t0 = mach_absolute_time()
+// Split into two programs, a *lazy* global in a non-main file crashes on first read with a runtime trap on
+// this toolchain (Swift 6.1; reproduced in a 20-line two-file case). So they are plain vars, set by
+// startClock(), which every entry point calls before anything else. Same values, one step earlier.
+nonisolated(unsafe) var timebase = mach_timebase_info_data_t()
+nonisolated(unsafe) var ticksPerSecond: Double = 0
+nonisolated(unsafe) var t0: UInt64 = 0
+func startClock() {
+    mach_timebase_info(&timebase)
+    ticksPerSecond = 1e9 * Double(timebase.denom) / Double(timebase.numer)
+    t0 = mach_absolute_time()
+}
 func now() -> Double { Double(mach_absolute_time() - t0) / ticksPerSecond }
 /// Waits for a moment on the clock: sleeps, and spins only for the last ~1.5 ms (keeps timing tight
 /// without pinning a CPU core).
@@ -1514,78 +1524,3 @@ func signOff(seconds: Int, actuations: Int) {
     print("")
 }
 
-// MARK: - Main
-
-var args = Array(CommandLine.arguments.dropFirst())
-/// The value after `flag` (and removes both), or nil if the flag isn't there. A flag with no value is a mistake.
-func option(_ flag: String, example: String) -> String? {
-    guard let i = args.firstIndex(of: flag) else { return nil }
-    guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else { usageError("\(flag) needs a value, like: \(flag) \(example)") }
-    let v = args[i + 1]; args.removeSubrange(i...(i + 1)); return v
-}
-func flag(_ f: String) -> Bool { if let i = args.firstIndex(of: f) { args.remove(at: i); return true }; return false }
-
-if flag("--help") || flag("-h") {
-    print("""
-    NO SPEAKER · a90.com presents
-    Your MacBook's trackpad has no speaker. This makes it talk anyway, through its haptic motor.
-
-      nospeaker                         the show (space skips a part, q goes to the end)
-      nospeaker "any words"             just say something
-      nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
-      --voice Daniel                    any voice from `say -v '?'`
-      --dark                            white on black instead of black on white
-      --plain                           no visuals
-
-    Mute your Mac: it still talks. Put it on a table, and keep your hands off the trackpad until it asks.
-    a90.com · x.com/codycollier
-    """)
-    exit(0)
-}
-
-voiceName = option("--voice", example: "Daniel")
-if let v = voiceName, !voiceExists(v) {
-    fail("There's no voice called \"\(v)\" on this Mac.\nList the voices you have with: say -v '?'", headline: "nospeaker can't use that voice.", code: 64)
-}
-applyTheme(light: !flag("--dark"))
-let plain = flag("--plain")
-let wantsSweep = flag("--sweep")
-if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
-
-signal(SIGINT) { _ in requestEnd() }
-signal(SIGTERM) { _ in stopRequested = true }
-atexit { restoreTerminal() }
-
-motor = openMotor()
-motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
-
-if wantsSweep || !args.isEmpty {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
-    if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
-    if !args.isEmpty {
-        let text = args.joined(separator: " ")
-        let frames = render(text)
-        print("trackpad: “\(text)”")
-        talk(frames, text: text)
-    }
-} else {
-    let interactive = isatty(STDOUT_FILENO) == 1 && isatty(STDIN_FILENO) == 1
-    // Too small a window: say so, and start by itself as soon as it's big enough.
-    if !plain && interactive {
-        var size = terminalSize()
-        if size.w < 80 || size.h < 24 {
-            print("\n  nospeaker needs a slightly bigger window: at least 80 × 24.")
-            print("  Drag the window's corner to make it bigger, and it starts by itself.  (ctrl-c to stop)\n")
-            while (size.w < 80 || size.h < 24) && !stopRequested && !jumpToCredits {
-                usleep(200_000)
-                size = terminalSize()
-            }
-            if stopRequested || jumpToCredits { exit(0) }
-        }
-    }
-    let size = terminalSize()
-    let visuals = !plain && interactive && size.w >= 80 && size.h >= 24
-    show(visuals: visuals)
-}
-usleep(120_000)
-if let motor { _ = actuatorClose?(motor) }

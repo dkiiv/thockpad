@@ -1,76 +1,64 @@
 #!/bin/sh
-# Builds nospeaker as one program for Apple Silicon and Intel Macs.
+# Builds thockpad (and the nospeaker it's built on) as one program for this Mac.
 #
-#   ./build.sh            build ./nospeaker (signed for this Mac only)
-#   ./build.sh release    also sign it with your Developer ID, have Apple notarize it, and make
-#                         dist/nospeaker.zip, which runs on any Mac without security warnings
+#   ./build.sh              build ./build/thockpad and ./build/nospeaker (this Mac)
+#   ./build.sh universal    the same, fat arm64 + x86_64 (needs both SDK targets)
+#
+# Each build is signed ad-hoc with a stable identifier, which is what makes an Input Monitoring grant
+# survive recompiling (see scripts/permissions.sh). Upstream's notarized-release flow lives in the
+# nospeaker repo; this fork builds locally and runs the binary from ./build.
+#
+# Two binaries from one engine: nospeaker/engine.swift holds only declarations, so it compiles with either
+# entry point — main.swift (thockpad) or nospeaker/main.swift (the original show).
 set -e
-mode="$1"
 cd "$(dirname "$0")"
 
-fail() {
-    printf '\n  nospeaker: %s\n\n' "$1" >&2
-    exit 1
-}
+fail() { printf '\n  thockpad: %s\n\n' "$1" >&2; exit 1; }
+
+# Read the mode now: the Swift version check below uses `set --` and overwrites the positional parameters.
+mode="${1:-build}"
 
 [ "$(uname -s)" = "Darwin" ] || fail "this builds on macOS only (it drives a Mac's trackpad)."
+{ xcode-select -p >/dev/null 2>&1 && command -v swiftc >/dev/null 2>&1; } || fail "Swift isn't installed: xcode-select --install"
 
-# /usr/bin/swiftc exists even without developer tools (it only offers to install them), so ask xcode-select.
-{ xcode-select -p >/dev/null 2>&1 && command -v swiftc >/dev/null 2>&1; } || fail "Swift isn't installed. Install Apple's Command Line Tools:
-
-    xcode-select --install
-
-  then run ./build.sh again."
-
-# Swift 5.7 or newer (Xcode 14 or later).
 version=$(swiftc --version 2>/dev/null | sed -n 's/.*Swift version \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
 set -- $version
-if [ -z "$1" ] || [ "$1" -lt 5 ] || { [ "$1" -eq 5 ] && [ "$2" -lt 7 ]; }; then
-    fail "this needs Swift 5.7 or newer, and found ${1:-?}.${2:-?}. Update Xcode or the Command Line Tools
-  (Software Update, or: xcode-select --install)."
-fi
+[ "${1:-0}" -ge 5 ] && { [ "$1" -gt 5 ] || [ "${2:-0}" -ge 7 ]; } || fail "needs Swift 5.7 or newer (found ${1:-?}.${2:-?})."
 
 mkdir -p build
-echo "building for Apple Silicon…"
-swiftc -O -target arm64-apple-macos12 nospeaker.swift -o build/nospeaker-arm64 \
-    || fail "the Apple Silicon build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
-echo "building for Intel…"
-swiftc -O -target x86_64-apple-macos13 nospeaker.swift -o build/nospeaker-x86_64 \
-    || fail "the Intel build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
+ENGINE="nospeaker/engine.swift"
+THOCK="clicks.swift keys.swift talk.swift main.swift"
 
-lipo -create build/nospeaker-arm64 build/nospeaker-x86_64 -output build/nospeaker
-codesign -s - -f build/nospeaker 2>/dev/null
-mv -f build/nospeaker nospeaker     # a rename, so a copy that's already running isn't disturbed
-echo "built ./nospeaker ($(lipo -archs nospeaker)). Run it with: ./nospeaker"
+build_for() {   # build_for <target> <out-suffix> [extra swiftc flags…]
+    target="$1"; suffix="$2"; shift 2
+    echo "building thockpad ($target)…"
+    swiftc -O -target "$target" $ENGINE $THOCK -o "build/thockpad-$suffix" "$@"
+    echo "building nospeaker ($target)…"
+    swiftc -O -target "$target" $ENGINE nospeaker/main.swift -o "build/nospeaker-$suffix" "$@"
+}
 
-[ "$mode" = "release" ] || exit 0
+case "$mode" in
+build)
+    build_for arm64-apple-macos12 arm64
+    mv -f build/thockpad-arm64 build/thockpad
+    mv -f build/nospeaker-arm64 build/nospeaker
+    ;;
+universal)
+    build_for arm64-apple-macos12 arm64
+    build_for x86_64-apple-macos13 x86_64
+    lipo -create build/thockpad-arm64 build/thockpad-x86_64 -output build/thockpad
+    lipo -create build/nospeaker-arm64 build/nospeaker-x86_64 -output build/nospeaker
+    rm -f build/*-arm64 build/*-x86_64
+    ;;
+*)
+    fail "unknown mode \"$mode\" (build, universal, release)."
+    ;;
+esac
 
-# Release: Developer ID signature (with the hardened runtime Apple requires), then notarization.
-identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1)
-[ -n "$identity" ] || fail "no Developer ID Application certificate in your keychain. Add one in Xcode:
-  Settings > Accounts > your team > Manage Certificates > + > Developer ID Application,
-  then run ./build.sh release again."
+# An ad-hoc signature with a fixed identifier, so an Input Monitoring grant survives rebuilding the file.
+# (See scripts/permissions.sh — that also prints what to click.)
+codesign --force --sign - --identifier com.dkiiv.thockpad build/thockpad 2>/dev/null || true
+codesign --force --sign - --identifier com.dkiiv.nospeaker build/nospeaker 2>/dev/null || true
 
-profile="${NOTARY_PROFILE:-nospeaker}"
-xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1 || fail "no saved notary sign-in called \"$profile\". Save one once (it asks for an app-specific password,
-  made at account.apple.com > Sign-In and Security > App-Specific Passwords):
-
-    xcrun notarytool store-credentials $profile --apple-id <your Apple ID> --team-id <your team ID>
-
-  then run ./build.sh release again."
-
-echo "signing with $identity…"
-codesign --force --options runtime --timestamp --sign "$identity" nospeaker
-codesign --verify --strict nospeaker
-
-mkdir -p dist
-rm -f dist/nospeaker.zip
-ditto -c -k --norsrc --noextattr nospeaker dist/nospeaker.zip    # the program alone, at the top of the zip
-
-echo "sending to Apple for notarization (usually a minute or two)…"
-xcrun notarytool submit dist/nospeaker.zip --keychain-profile "$profile" --wait \
-    || fail "notarization didn't pass. See why with: xcrun notarytool log <submission id> --keychain-profile $profile"
-
-codesign --verify --strict -R="notarized" --check-notarization nospeaker \
-    || fail "Apple accepted it, but macOS can't confirm the notarization yet. Try again in a minute."
-echo "released: dist/nospeaker.zip, signed and notarized. Attach it to the GitHub release."
+printf '\n  built ./build/thockpad (%s) and ./build/nospeaker (%s)\n' "$(lipo -archs build/thockpad)" "$(lipo -archs build/nospeaker)"
+printf '  try: ./build/thockpad --selftest   then   ./build/thockpad\n'

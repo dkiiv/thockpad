@@ -1,152 +1,119 @@
-```text
-────────────────────────  a90.com presents  ─────────────────────────
+# thockpad
 
-    _   __ ____      _____  ____   ______ ___     __ __  ______ ____
-   / | / // __ \    / ___/ / __ \ / ____//   |   / //_/ / ____// __ \
-  /  |/ // / / /    \__ \ / /_/ // __/  / /| |  / ,<   / __/  / /_/ /
- / /|  // /_/ /    ___/ // ____// /___ / ___ | / /| | / /___ / _, _/
-/_/ |_/ \____/    /____//_/    /_____//_/  |_|/_/ |_|/_____//_/ |_|
+**Make your MacBook's trackpad thock like a mechanical keyboard.**
 
-─  haptic voice synthesis  ─────────────────────────────  trackpad  ─
+thockpad listens to your real keystrokes and fires the trackpad's haptic motor once per press — the Force
+Touch "click" motor — tuned into the sound of a mechanical keyboard. It's a fork of
+[nospeaker](https://github.com/os6/nospeaker), which showed that the trackpad motor, driven up to 4 kHz,
+can make *sounds*, not just clicks. thockpad uses that as an engine: no sample files, no speakers, no audio
+device. One or two sine tones, a few milliseconds each, straight to the motor.
+
+```
+        ┌────────────┐   CGEventTap   ┌────────────┐   MultitouchSupport   ┌─────────┐
+keys ──▶│ your Mac   │───────────────▶│ thockpad   │──────────────────────▶│ motor   │──▶ thock
+        └────────────┘  key down/up   │ 15 ms gate │   2 tones / click     └─────────┘
+                                      └────────────┘
 ```
 
-**Mute your Mac. Your trackpad will still talk.**
-
-There's no speaker in a MacBook trackpad, just a small haptic motor that taps the glass so you feel a click.
-NO SPEAKER drives that motor up to 4,000 times a second, fast enough to make sound you can hear, and turns it
-into a voice. It talks, sings, raps, and becomes an instrument under your finger.
-
-One command. About a minute and a half. No speakers used.
-
-<!-- demo video: drag an .mp4 here in GitHub's editor -->
-
-## 01 / before you start
-
-```text
-[ mute your mac ]        it still talks; that's the point
-[ put it on a table ]    on your lap it's much quieter
-[ hands off the glass ]  until it asks you to touch it
+```
+[ mute your mac ]        it still clicks; that's the point
+[ on a table ]           on your lap it's much quieter
 ```
 
-**Space** skips a part. **q** or **Ctrl-C** goes to the end.
-
-## 02 / run it
-
-`[ one line ]`
+## Run it
 
 ```sh
-curl -fsSL a90.com/nospeaker | sh
+./build.sh                # builds ./build/thockpad (and ./build/nospeaker, the fork's parent)
+./build/thockpad          # start clicking (silent start — just type)
 ```
 
-Downloads the latest release to `~/.local/bin/nospeaker` and starts the show. `a90.com/nospeaker` points
-to [play.sh](play.sh) in this repo, so you can read what it runs first.
+macOS asks for **Input Monitoring** the first time: allow it in System Settings → Privacy & Security →
+Input Monitoring, then start thockpad again (a fresh grant only applies to a new process). `./build.sh`
+signs each build with a stable identifier (`com.dkiiv.thockpad`) so the grant survives recompiling —
+without that, every rebuild asks again. `./scripts/permissions.sh --check` tells you where you stand.
 
-`[ download ]`
-
-Grab `nospeaker.zip` from the [latest release](https://github.com/os6/nospeaker/releases/latest),
-unzip it and run `./nospeaker` in Terminal. Signed with a Developer ID and notarized by Apple.
-
-`[ from source ]`
-
-Needs Xcode or the Command Line Tools (`xcode-select --install`). Builds one program for Apple Silicon
-and Intel Macs.
+## Play with it
 
 ```sh
-git clone https://github.com/os6/nospeaker
-cd nospeaker
-./build.sh
-./nospeaker
+./build/thockpad --list                # the click profiles
+./build/thockpad --profile blue        # clicky: bright snap
+./build/thockpad --profile thock       # deep marbly thock (the default)
+./build/thockpad --level 0.6           # quieter clicks
+./build/thockpad --no-release          # no bottom-out tock on key-up
+./build/thockpad --talk                # it says a word on space, "done" on return (via nospeaker)
+./build/thockpad --verbose             # print each key as it clicks
+./build/thockpad --swallow             # your real typing goes nowhere, only clicks (testing!)
+./build/thockpad --selftest            # one synthetic keypress, proves the click loop
+./build/thockpad --run 60              # quit by itself after 60 s and print stats
 ```
 
-## 03 / play with it
+Ctrl-C stops it. `kill -USR1 <pid>` prints how you're doing (presses, releases, keys/second).
+It starts and runs **silently**: no startup sound, no terminal chatter unless you ask for it.
 
-```text
-./nospeaker "hello there"            say anything
-./nospeaker --voice Daniel "hello"   in another macOS voice
-./nospeaker --sweep                  a rising tone, 100 Hz to 4 kHz
+## How a click is made
 
---dark                               white on black
---plain                              no visuals, plain text
+A profile is a list of tones — frequency, strength, length, offset — played through nospeaker's
+`play()`:
+
+| profile  | the idea                  | tones                                   |
+|----------|---------------------------|-----------------------------------------|
+| brown    | tactile bump              | 1400 Hz / 7 ms + 380 Hz / 18 ms         |
+| blue     | clicky                    | 2200 Hz / 5 ms + 240 Hz / 14 ms         |
+| red      | linear, quiet             | 900 Hz / 6 ms                           |
+| thock    | deep marbly (the good one)| 520 Hz / 8 ms + 140 Hz / 34 ms          |
+| click    | membrane pop              | 1700 Hz / 4 ms + 1050 Hz / 7 ms         |
+| marble   | glassy tock               | 1900 Hz / 4 ms + 2800 Hz / 6 ms         |
+
+nospeaker measured this motor to be loud from ~100 Hz to 4 kHz and cleanest near 1 kHz, which is the
+register a keyboard click lives in. Every key gets a fixed detune from its keycode plus slow drift, so a
+burst of typing sounds like a board, not a machine gun; space bars and shifts drop ~22 % in pitch and
+stretch, because big keys sound bigger. A key-up adds a quieter, lower "tock".
+
+Two engineering notes:
+
+- **15 ms floor.** The motor can't mix two actuations, and nospeaker restarts it per call. Anything within
+  15 ms of the previous click is dropped rather than queued (the queue itself is capped at 3 clicks) —
+  holding a key or pasting a paragraph stays in time and never backs up.
+- **The tap is passive by default.** thockpad listens at the session event tap and passes every event
+  through, so typing latency is untouched and nothing about your Mac changes. `--swallow` (which drops
+  key-downs so only the clicks happen — good for hearing a single profile cleanly) never drops key-*up*s:
+  a lost release sticks modifiers.
+
+## The fork
+
+`nospeaker/engine.swift` is upstream's `nospeaker.swift` with two changes, and everything under
+`nospeaker/` is upstream:
+
+1. its `// MARK: - Main` block moved to `nospeaker/main.swift`, so the engine is declarations-only and
+   compiles into two programs (`thockpad`, `nospeaker`);
+2. the clock globals (`timebase`, `ticksPerSecond`, `t0`) became plain `nonisolated(unsafe)` vars set by
+   `startClock()`, called first thing by each entry point. Reason found the hard way: on Swift 6.1, a
+   *lazy* global in a non-`main.swift` file traps (SIGTRAP, no message) on first read — reproduced in a
+   20-line two-file case; eager init from the entry point works.
+
+thockpad's own files: `clicks.swift` (profiles, tone math, `playClick`), `keys.swift` (event tap,
+permission, stats), `talk.swift` (the `--talk` words, through nospeaker's voice engine).
+
+## Tested on
+
+```
+MacBook Pro 14" (MacBookPro18,3)   M1 Pro   macOS 27.0.1   trackpad clicks on real keys ✓
+nospeaker (upstream show)          still builds and talks from the split engine        ✓
 ```
 
-## 04 / needs
+Not tested: Intel Macs, Magic Trackpad, other macOS versions — same caveats as upstream, since it's the
+same private `MultitouchSupport` calls. If it doesn't work on your Mac, upstream's issue tracker is
+probably the place anyway.
 
-A Force Touch trackpad (built into MacBooks from 2015 on, or a Magic Trackpad 2 or newer), and macOS 12 or
-later on Apple Silicon, or macOS 13 or later on Intel. Without a Force Touch trackpad, it says so and exits.
+## Caveats
 
-```text
-tested on
+- `MultitouchSupport` is private and undocumented; a macOS update can break this. (Upstream's caveat,
+  inherited whole.)
+- thockpad needs Input Monitoring. It runs in the background and stores nothing; the stats are printed on
+  request and live in memory only.
+- The motor is never driven past its normal maximum strength — same rule as upstream.
 
-MacBook Pro (Mac17,10)   M5 Max   macOS 27.2.1   everything works
-```
+## License
 
-Not tested yet: Intel Macs, a Magic Trackpad, and older versions of macOS. MultitouchSupport is private, so
-older systems may lack the functions it uses, and loudness differs between trackpads. If you try it on another
-Mac, open an issue with your model, your macOS version and how it sounded.
-
-## 05 / how it works
-
-```text
-say ──▶ formants ──▶ two tones ──▶ motor ──▶ glass
-        per 10 ms    F1 + F2       haptics   sound
-```
-
-**Why you can hear it.** The trackpad has no speaker, but the motor moves the glass. Driven back and forth
-hundreds or thousands of times a second, the glass vibrates fast enough to make sound you can hear. It's quiet
-because the motor is built for short taps, not for sound.
-
-**The motor.** `MultitouchSupport` is the private framework macOS uses for the trackpad. Its function
-`MTActuationCreateFromDictionary` takes a description of a vibration, a list of sine tones with a frequency,
-a strength and a length each, and `MTActuationActuate` plays it on the motor. Apple's public haptics API only
-offers three fixed taps.
-
-**The range.** Measured with the MacBook's own microphone, every semitone from 98 Hz to 3,951 Hz: how loud it
-is over a quiet room, and how much of the sound is the note itself.
-
-```text
-│                                      ###
-│                          #+#     +++#####        #
-│                         +#+#+   .+++#####       .#
-│              .       ++++#+#+   .+++#####    # #.# #
-│   ++        +. . #..+++++#+#++++.+++#####+ #####.###          .#
-│   +++#.     +...+#..+++++#+#++++.+++#####+ #####.####+        .#
-│  ++++#...   +...+#..+++++#+#++++.+++#####+.#####.####+        .#
-│ .++++#...++++...+#..+++++#+#++++.+++#####+.#####.####+  +#    .#
-│..++++#...++++...+#..+++++#+#++++.+++#####+.#####.####+#.+#  .#.#
-│..++++#...++++...+#..+++++#+#++++.+++#####+.#####.####+#.+#+..#.#
-└─────────────────────────────────────────────────────────────────
-      131         262         523         1047        2093    3951
-   public notes stop at 600 Hz ─┘
-
-across: every semitone, in Hz · up: loudness, +16 to +34 dB
-# clean note   + fair   . mostly buzz
-```
-
-It's loud from about 100 Hz to 4 kHz, with a few dead spots where the glass resonates. Its loudest, cleanest
-notes are around 1 kHz, which covers the most important part of a voice.
-
-**The voice.** macOS's own voice speaks the line into memory. Every 10 ms, linear prediction finds the voice's
-two strongest resonances (formants), its loudness and its pitch. The motor plays those two resonances as tones,
-restarted on every beat of the pitch, so they buzz like a voice instead of whistling. Hiss sounds (s, f, t)
-become quick bursts of high tones. Two resonances beat three: in a blind test they were clearer, and louder,
-because the motor's strength is split fewer ways.
-
-It sounds robotic, and it's much easier to follow when you can read along, which is why the show types every
-line as it speaks.
-
-**The code.** One Swift file, [nospeaker.swift](nospeaker.swift), with no dependencies.
-
-## 06 / caveats
-
-- **Is it safe?** It never drives the motor past its normal maximum strength. Going past it is possible and
-  louder, but the driver starts to stall, so nospeaker doesn't.
-- MultitouchSupport is private and undocumented, so a macOS update could break this.
-
-The MultitouchSupport function names were learned from the open-source Tactile project. Everything else was
-measured on a MacBook.
-
-```text
-──────────────────────  thanks for listening  ───────────────────────
-```
-
-Made by [Cody Collier](https://x.com/codycollier) · [a90.com](https://a90.com) · [MIT license](LICENSE)
+MIT, same as upstream — see `LICENSE`. nospeaker is © Cody Collier / a90.com;
+`nospeaker/README.md` is its original readme.
