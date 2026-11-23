@@ -34,18 +34,75 @@ let spaceCode = 49, returnCode = 36, deleteCode = 51
 /// Whole clicks waiting to be played. One worker plays them in order (the motor can't mix two actuations),
 /// and the queue is deliberately shallow: past a few clicks, newer keys are dropped rather than queued, so
 /// thockpad never falls behind a paste or a held key.
-struct Click { var tones: [Tone]; var level: Float; var word: String? }
+struct Click {
+    var tones: [Tone]
+    var level: Float
+    var word: String? = nil
+    var priority = true
+    var at = 0.0              // when the key edge happened, so a click that can't play soon is dropped
+}
+
+/// How long a click may be late and still be played, in seconds. A click is a *reaction*: past this the
+/// moment has gone, and playing it is the app making noise that isn't attached to anything you did.
+///
+/// Sized to the measurements, not to hope: the poll loop's real period on this Mac is ~6–12 ms (kernel
+/// sleep floor) and can spike to ~80 ms under OS load, and a queued click waits behind at most three
+/// others at ~4 ms each. So 80 ms is generous enough that a healthy pipeline never trips it, while still
+/// being short enough that a burst resurrected after a stall (App Nap, laptop sleep) never plays.
+let staleClickSeconds = 0.08
+
+/// The poll loop's own period is ~6 ms here and OS noise puts its worst gap in the tens of ms, so the
+/// watchdog only calls a *stall* something far beyond that: a freeze, not a scheduling hiccup.
+let pollStallSeconds = 0.5
 let clickLock = NSLock()
 var pending: [Click] = []
 let clickSemaphore = DispatchSemaphore(value: 0)
 let maxQueuedClicks = 3
 
+/// How long a click occupies the *driver*, in seconds — not how long it rings.
+///
+/// The whole click fires as ONE actuation (see `playClick`), which costs ~3.5 ms of measured driver time.
+/// The sound then rings on for the length of its tones (a thock's deep tone runs 34 ms), but reserving that
+/// too is what caused the original bug: two presses 25 ms apart — an ordinary fast pair inside a word —
+/// and the second one was refused, i.e. a silent key. So only the driver cost is reserved, with the 15 ms
+/// actuation floor on top (measured: the driver needs it between actuations), which allows ~66 clicks a
+/// second: more than any typing. Presses closer than that overlap, and the later click truncates the tail
+/// of the earlier one — the same thing a real board does when you type fast, and far better than silence.
+func clickSeconds(_ tones: [Tone]) -> Double { _ = tones; return 0.004 }   // measured one-call driver cost
+
+/// When the driver will next accept an actuation. A click costs ~4 ms of driver time and the driver needs
+/// the 15 ms actuation floor between them, so the reservation is that floor: ~66 clicks a second, more
+/// than any typing. Reserving the *sound* length instead (34 ms for a thock) is what made ordinary fast key
+/// pairs go silent.
+let motorLock = NSLock()
+nonisolated(unsafe) var motorBusyUntil = 0.0
+
+/// Claim the next driver slot for a press at `t`. A press arriving while the driver is busy waits behind it
+/// — a few ms late is still the same keystroke — but if the wait would exceed the stale window the click is
+/// refused, because queueing it would make the sound drift away from the fingers.
+func claimMotor(at t: Double, seconds: Double) -> Bool {
+    motorLock.lock(); defer { motorLock.unlock() }
+    let start = max(motorBusyUntil, t)
+    if start - t > staleClickSeconds { return false }
+    motorBusyUntil = start + max(seconds, throttleSeconds)
+    return true
+}
+
+/// A key-release tock is garnish: it never claims the motor and never waits in line ahead of a press —
+/// the worker drops it the moment a press is behind it (and it's dropped first when the queue is full).
 func enqueue(_ click: Click) {
     clickLock.lock()
     if pending.count >= maxQueuedClicks {
-        clickLock.unlock()
-        statsLock.lock(); stats.throttled += 1; statsLock.unlock()
-        return
+        if let slot = pending.firstIndex(where: { !$0.priority }) { pending.remove(at: slot) }
+        else if !click.priority {
+            // A tock can't even evict... it loses its own place in line.
+            clickLock.unlock()
+            return
+        } else {
+            clickLock.unlock()
+            statsLock.lock(); stats.throttled += 1; statsLock.unlock()
+            return
+        }
     }
     pending.append(click)
     clickLock.unlock()
@@ -67,7 +124,20 @@ func startClickWorkerIfNeeded() {
             clickLock.lock()
             guard !pending.isEmpty else { clickLock.unlock(); continue }
             let click = pending.removeFirst()
+            // A tock only plays if no press is waiting behind it — presses are the point of the app.
+            if !click.priority, pending.contains(where: { $0.priority }) {
+                clickLock.unlock()
+                statsLock.lock(); stats.tocksDropped += 1; statsLock.unlock()
+                continue
+            }
+            let age = now() - click.at
             clickLock.unlock()
+            // Late is wrong: only play a click while it still feels like it belongs to the keystroke.
+            if age > staleClickSeconds {
+                statsLock.lock(); stats.late += 1; statsLock.unlock()
+                if verbose { report("✗ dropped, \(Int(age * 1000)) ms late") }
+                continue
+            }
             playClick(click.tones, at: click.level)
             if let word = click.word { queueWord(word) }
         }
@@ -80,7 +150,7 @@ func startClickWorkerIfNeeded() {
 // MARK: - Stats
 
 struct Stats {
-    var down = 0, up = 0, throttled = 0, spoken = 0
+    var heard = 0, down = 0, up = 0, throttled = 0, spoken = 0, tocksDropped = 0, late = 0
     var first = -1.0, last = -1.0, active = 0.0
     var lastKey = ""            // name of the most recent key press seen
     var lastKeyAt = 0.0
@@ -130,7 +200,19 @@ func openMotorIfNeeded() {
 
 // MARK: - Listening: poll the key state
 
-var lastClickAt = -1.0
+/// App Nap is fatal here: a window-less (or hidden) AppKit app gets its threads throttled into a freeze,
+/// and this one has to poll forever. Measured on this Mac: 95 s after launch the poller's CPU dropped
+/// 2.7 % → 0.5 % and 20 keystrokes produced zero presses and zero actuations. When the process woke again
+/// (clicking the menu bar icon), every key that changed state in between fired at once — a burst of
+/// clicks. Holding this activity assertion disables App Nap for the process.
+nonisolated(unsafe) var appNapAssertion: AnyObject?
+func preventAppNap() {
+    guard appNapAssertion == nil else { return }
+    appNapAssertion = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+        reason: "thockpad polls the keyboard forever; a frozen poller means silent keys and a burst on wake")
+}
+
 var pollRunning = false
 let pollLock = NSLock()
 
@@ -138,23 +220,55 @@ func startListeningIfNeeded() {
     pollLock.lock(); defer { pollLock.unlock() }
     guard !pollRunning else { return }
     pollRunning = true
+    preventAppNap()
     let thread = Thread { pollKeys() }
-    thread.qualityOfService = .userInitiated
+    // .userInteractive, not .userInitiated: a quick tap whose whole 30 ms hold lands inside a scheduling
+    // gap is missed entirely (down and up both change while we're descheduled → net zero, not even an
+    // edge), and .userInitiated is what the scheduler feels free to hold off for tens of ms. A pass costs
+    // ~0.00 ms of CPU, so the highest priority is cheap here; this is the whole point of the app.
+    thread.qualityOfService = .userInteractive
     thread.name = "thockpad-poll"
     thread.start()
 }
 
 var listening: Bool { pollLock.lock(); defer { pollLock.unlock() }; return pollRunning }
 
-/// Read every key's state 500× a second, click on the edges. 128 boolean queries per pass costs ~2.7 % of
-/// one M1 core (top, idle); measured, not hoped (a probe tracked live typing on this Mac with transitions
-/// matching keystroke-for-keystroke, and saw injected System Events keys with no permission granted).
+/// Read every key's state, click on the edges. Honest numbers for this Mac (measured with the identical
+/// loop, `waitbench`): any wait bottoms out at ~5.8 ms because of the kernel's sleep floor, so this loop
+/// runs at ~90–170 passes a second, not 500 — at 0.1 % of one core. That is still 6–30× faster than the
+/// 30–100 ms a human key is held down, so nothing is missed; `usleep(2_000)` asking for 2 ms is just the
+/// cheapest way to ask. (Spinning would give ~1.6 M passes/s at ~99 % CPU. Not happening for a toy.)
+///
+/// One safety rule: a pass that starts more than half a second after the last one means this thread was
+/// frozen (App Nap, laptop sleep, CPU starvation). Whatever changed while we were gone is history, not a
+/// keystroke — silently resync the snapshot instead of firing a click per key, which is what made clicking
+/// the menu bar icon "spam the sound" after the app sat idle.
+let watchdogLock = NSLock()
+nonisolated(unsafe) var lastPassAt = 0.0
+nonisolated(unsafe) var worstPassGap = 0.0
+func pollHealth() -> (age: Double, worst: Double) {
+    watchdogLock.lock(); defer { watchdogLock.unlock() }
+    return (now() - lastPassAt, worstPassGap)
+}
+
 func pollKeys() {
     var keyState = [Bool](repeating: false, count: 128)
     // Snapshot current state first so keys already held when thockpad starts don't fire phantom clicks,
     // and their release doesn't fire a tock.
     for code in 0..<128 { keyState[code] = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code)) }
+    var lastPass = now()
+    watchdogLock.lock(); lastPassAt = lastPass; watchdogLock.unlock()
     while !stopRequested {
+        let passStart = now()
+        if passStart - lastPass > 0.5 {
+            for code in 0..<128 { keyState[code] = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code)) }
+            motorLock.lock(); motorBusyUntil = passStart; motorLock.unlock()   // whatever we reserved is long gone
+            say("thockpad: was stopped for \(String(format: "%.1f", passStart - lastPass)) s — resynced; keys missed while stopped stay silent.")
+        }
+        watchdogLock.lock()
+        worstPassGap = max(worstPassGap, passStart - lastPass)
+        lastPass = passStart
+        watchdogLock.unlock()
         for code in 0..<128 {
             let down = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code))
             if down == keyState[code] { continue }
@@ -162,15 +276,14 @@ func pollKeys() {
             guard !paused else { continue }        // paused: keep tracking state, just never click
             if down {
                 let t = now()
-                if t - lastClickAt < throttleSeconds {
-                    statsLock.lock(); stats.throttled += 1; statsLock.unlock()
-                } else {
-                    lastClickAt = t
+                statsLock.lock(); stats.heard += 1; statsLock.unlock()   // heard ≠ clicked: see below
+                let tones = clickTones(for: code, at: t)
+                if claimMotor(at: t, seconds: clickSeconds(tones)) {
                     if verbose { report("↓ \(keyName(code))") }
                     let word: String? = talkEnabled
                         ? (code == spaceCode ? wordBank.randomElement() : code == returnCode ? finishers.randomElement() : nil)
                         : nil
-                    enqueue(Click(tones: clickTones(for: code, at: t), level: gain, word: word))
+                    enqueue(Click(tones: tones, level: gain, word: word, at: t))
                     statsLock.lock()
                     if stats.first < 0 { stats.first = t }
                     if stats.last > 0, t - stats.last < 1.0 { stats.active += t - stats.last }
@@ -179,16 +292,23 @@ func pollKeys() {
                     stats.lastKeyAt = t
                     stats.down += 1
                     statsLock.unlock()
+                } else {
+                    // The motor is still busy with an earlier click: dropping is the only honest option,
+                    // because queueing it would land the sound late and push every later key further behind.
+                    statsLock.lock(); stats.throttled += 1; statsLock.unlock()
+                    if verbose { report("· \(keyName(code)) (motor busy)") }
                 }
             } else {
                 let tones = releaseTones()
                 guard !tones.isEmpty else { continue }
                 if verbose { report("↑") }
-                enqueue(Click(tones: tones, level: gain * Float(currentProfile.release)))
+                // A tock never blocks and is never queued ahead of a press: it fills spare motor time, and
+                // is the first thing dropped when presses need the slot.
+                enqueue(Click(tones: tones, level: gain * Float(currentProfile.release), priority: false, at: now()))
                 statsLock.lock(); stats.up += 1; statsLock.unlock()
             }
         }
-        usleep(2_000)
+        usleep(1_000)   // asking under the ~5.8 ms floor still polls ~2× faster at the same 0.1 % CPU
     }
 }
 
@@ -200,7 +320,8 @@ func printStatus() {
     let rate = s.active > 0 ? Double(s.down) / s.active : 0
     report("""
     thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(talkEnabled ? " · talking" : "")\(paused ? " · PAUSED" : "")
-    \(s.down) presses, \(s.up) releases, \(s.throttled) too fast, \(s.spoken) words · \(String(format: "%.1f", rate)) keys/second
+    \(s.heard) keys heard → \(s.down) clicks (\(s.throttled) refused, \(s.late) too late), \(s.up) tocks (\(s.tocksDropped) skipped), \(s.spoken) words · \(String(format: "%.1f", rate)) keys/second
+    poll loop: worst gap \(String(format: "%.0f", pollHealth().worst * 1000)) ms (\(pollHealth().worst < pollStallSeconds ? "healthy" : "STALL — something is throttling thockpad"))
     ctrl-c stops it (or kill -USR1 \(getpid()) prints this).
     """)
 }
@@ -223,6 +344,16 @@ func runThockpad() -> Int32 {
     if let motor { _ = actuatorClose?(motor) }
     return 0
 }
+
+// MARK: - Why there is no synthetic-key bench
+//
+// A bench that posts CGEvents and counts what the poller hears looks obvious and is a lie on this Mac,
+// measured three ways: a posted right-shift produced ZERO edges even at 250 ms spacing (modifier state does
+// not reach `keyState` through posting at all), a posted F13 produced 14 edges for 10 presses (140 %), and
+// hit-rate came out INVERSE to hold time (80 % at 5 ms, 20 % at 30 ms) — the opposite of a sampling
+// explanation. So `--selftest --post-keys` stays a smoke test (it only asks "did anything arrive?"), and
+// the real numbers come from the app itself while you type: heard → clicked, refused, too late, worst gap.
+// Trusting the synthetic bench here would have meant "fixing" a poller that was never broken.
 
 // MARK: - Timed run (for testing)
 

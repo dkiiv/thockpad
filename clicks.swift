@@ -67,20 +67,31 @@ func say(_ s: String) { if chatter { report(s) } }
 
 // MARK: - Playing one click
 
-/// Play a click: each tone as its own short actuation, fired at its offset. Blocks until the click is over
-/// (a few ms) so callers can serialise them; nospeaker restarts the motor per actuation with no ramp, which
-/// is exactly the sharp attack a click needs.
+/// Play a whole click as ONE actuation: every tone carries its own frequency, strength, length and offset
+/// inside the same dictionary — the way nospeaker already plays its two formants together. This matters:
+/// `MTActuationActuate` blocks ~3.5 ms per *call* (measured: two calls took 13–22 ms, one merged call 3.5 ms)
+/// and the second call cuts the first tone off, so per-tone calls both cost the motor 4–6× more and flatten
+/// the click's body. The old code did one call per tone and thockpad fell behind real typing speed.
+///
+/// Amplitudes are normalised to sum to 1 exactly like nospeaker's play() — past that the driver stalls —
+/// and the call returns as soon as the actuation is handed off (~4 ms, measured). It deliberately does NOT
+/// wait for the sound to finish: the motor rings on by itself, and the old blocking tail capped the worker at
+/// ~28 clicks a second, so keystrokes sat in the queue until they went stale and were dropped. Serialising
+/// on the driver's real 15 ms floor (claimMotor) is enough; overlapping tails during fast bursts is what a
+/// real board does, and the later click simply truncates the earlier one.
 func playClick(_ tones: [Tone], at level: Float) {
-    guard !tones.isEmpty, level > 0 else { return }
+    guard !tones.isEmpty, level > 0, let motorPointer else { return }
     let l = min(1, max(0, level))
-    for tone in tones {
-        let fireAt = now() + tone.delay / 1000
-        while now() < fireAt && !stopRequested { usleep(100) }
-        if stopRequested { return }
-        play([(hz: tone.hz, amp: tone.amp)], ms: tone.ms, level: l)
-    }
-    let end = now() + (tones.map { $0.delay + $0.ms }.max() ?? 0) / 1000
-    while now() < end && !stopRequested { usleep(400) }
+    let sum = max(tones.reduce(0) { $0 + $1.amp }, 0.0001)
+    let end = tones.map { $0.delay + $0.ms }.max() ?? 0
+    let shape: [String: Any] = [
+        "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": end],
+        "Tones": tones.map { ["Type": "Sine", "Amplitude": $0.amp / sum, "DurationMS": $0.ms,
+                              "DelayMS": $0.delay, "FrequencykHz": $0.hz / 1000] },
+    ]
+    guard let act = actuationCreate?(shape as CFDictionary, 0) else { return }
+    _ = actuationPlay?(act, motorPointer, 0, l, 0)
+    Unmanaged<AnyObject>.fromOpaque(act).release()   // upstream's play() hands the actuation back the same way
 }
 
 /// The press click: the profile's tones plus a little life, so a run of keystrokes is a typewriter and not a

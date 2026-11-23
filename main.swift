@@ -4,6 +4,7 @@
 // runs the plain CLI engine instead: good for scripts, testing, and running headless. Settings you dial in
 // the GUI are remembered (settings.swift) and shared with the CLI, flags on top win.
 
+import AppKit      // NSWorkspace, for the single-instance check below
 import Darwin
 import Foundation
 
@@ -98,7 +99,20 @@ if let unknown = args.first(where: { $0.hasPrefix("-") }) { die("“\(unknown)�
 if !args.isEmpty { die("thockpad doesn't take words — it clicks. (nospeaker is the one that talks)") }
 
 // No flags at all: open the app window (and the menu bar item it hides into). runGUI never returns.
-if bare { runGUI() }
+if bare {
+    // One engine per bundle, always. Two Thockpad processes means every keystroke fires two clicks, which
+    // sounds like the app thocking on its own — and it is easy to reach by accident, because a downloaded
+    // Thockpad.app and a ./build/Thockpad.app are different programs to macOS. If another copy of THIS
+    // bundle is already running, wake it and get out of the way.
+    if let running = NSWorkspace.shared.runningApplications.first(where: {
+        $0.bundleIdentifier == Bundle.main.bundleIdentifier && $0.processIdentifier != getpid()
+    }) {
+        running.activate()
+        running.unhide()
+        exit(0)
+    }
+    runGUI()
+}
 
 if runSeconds > 0 { chatter = true; startTimer(runSeconds) }
 exit(wantsSelfTest ? selfTest(postKeys: postKeys) : runThockpad())

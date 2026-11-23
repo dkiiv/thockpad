@@ -40,6 +40,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>                 <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>          <string>12.0</string>
     <key>NSHighResolutionCapable</key>         <true/>
+    <!-- App Nap OFF, twice over: a hidden windowless app that must poll the keyboard 500× a second is
+         exactly what App Nap was built to throttle, and a napped poller means silent keys followed by a
+         burst of stale thocks when something wakes the process. The plist key is the deterministic switch;
+         ProcessInfo.beginActivity(.latencyCritical) covers the CLI. -->
+    <key>NSAppSleepDisabled</key>              <true/>
+    <key>NSSupportsSuddenTermination</key>     <false/>
     <key>NSHumanReadableCopyright</key>        <string>MIT · fork of nospeaker by Cody Collier (a90.com)</string>
 </dict>
 </plist>

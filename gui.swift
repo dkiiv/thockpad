@@ -286,12 +286,16 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func togglePause(_ sender: Any?) { paused.toggle(); persist(); refresh() }
 
     @objc func tryClick(_ sender: Any?) {
-        enqueue(Click(tones: clickTones(for: spaceCode, at: now()), level: gain))
+        enqueue(Click(tones: clickTones(for: spaceCode, at: now()), level: gain, at: now()))
     }
     @objc func restartApp(_ sender: Any?) {
+        // Relaunch this same bundle — but only after this process is gone, so the new instance can never
+        // stack on top of the old one (two pollers = every key thocks twice) and can never see the old one
+        // still running and refuse to start. `open -n` used to force exactly that overlap.
+        let wait = "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.05; done; /usr/bin/open '\(Bundle.main.bundlePath.replacingOccurrences(of: "'", with: "'\\''"))'"
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments = ["-n", Bundle.main.bundleURL.path]
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", wait]
         try? task.run()
         NSApp.terminate(nil)
     }
@@ -307,8 +311,10 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statsLock.lock(); let s = stats; statsLock.unlock()
         let rate = s.active > 0 ? Double(s.down) / s.active : 0
         let state = paused ? "paused" : (listening ? "listening" : "not listening")
-        let line = "\(state) · \(profileName) · level \(String(format: "%.2f", gain)) · \(s.down) presses"
-            + (s.throttled > 0 ? " · \(s.throttled) too fast" : "")
+        let health = pollHealth()
+        let line = "\(state) · \(profileName) · level \(String(format: "%.2f", gain)) · \(s.heard) keys heard"
+            + (s.throttled > 0 ? " · \(s.throttled) motor-busy" : "")
+            + (health.worst > pollStallSeconds ? String(format: " · ⚠ poll stalled %.0f ms", health.worst * 1000) : "")
             + (rate > 0 ? String(format: " · %.1f keys/s", rate) : "")
         statsMenuItem.title = line
 
@@ -335,8 +341,8 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let problem = motorProblem {
             statusLabel.stringValue = problem + "  (Fix it and press Restart thockpad.)"
             startEngine()          // retry: cheap, and heals sleep/wake and replug
-        } else if s.down > 0 {
-            statusLabel.stringValue = "Clicking — heard \(s.down) keystrokes, last was “\(s.lastKey)”. "
+        } else if s.heard > 0 {
+            statusLabel.stringValue = "Clicking — heard \(s.heard) keystrokes (\(s.down) clicked\(s.throttled > 0 ? ", \(s.throttled) motor-busy" : "")), last was “\(s.lastKey)”. "
                 + "Closing this window keeps thockpad running in the menu bar."
         } else {
             statusLabel.stringValue = "Clicking — type on your Mac and the trackpad thocks. "
