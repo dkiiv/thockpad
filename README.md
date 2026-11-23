@@ -14,6 +14,13 @@ keys ──▶│ your Mac   │────────────────
         └────────────┘  polls, no tap   │drvr budget │   2 tones / click     └─────────┘
 ```
 
+**The trackpad only moves when you press a key.** Nothing else — not launch, not opening its window, not
+the menu bar, not sleep, not a word, not a greeting. There is no speech feature to toggle by accident, no
+"try a click" button, and the haptic device is not even claimed until your first real keystroke (claiming it
+makes the trackpad thump, so thockpad defers that into the click it was about to make anyway). The click
+worker refuses to actuate on anything that didn't come from a keyboard edge; it's enforced in code, not by
+convention.
+
 **thockpad needs no permissions at all.** It reads Apple's key-state API (`CGEventSource.keyState`) and
 clicks on the edges — that query is not Input Monitoring, so nothing to allow in System
 Settings, nothing that can break between rebuilds, nothing that touches your keystrokes. Install and type.
@@ -59,7 +66,6 @@ The same engine without a window, for scripts and testing:
 ./build/thockpad --profile blue           # pick one
 ./build/thockpad --level 0.6              # quieter
 ./build/thockpad --no-release             # no bottom-out tock
-./build/thockpad --talk                   # says a word on space, "done" on return (via nospeaker)
 ./build/thockpad --verbose --chatter      # print each key + startup line
 ./build/thockpad --selftest               # start listening, prove a keypress clicks, then report
 ./build/thockpad --run 60                 # quit by itself after 60 s and print stats
@@ -126,8 +132,7 @@ Two engineering notes:
    20-line two-file case; eager init from the entry point works.
 
 thockpad's own files: `clicks.swift` (profiles, tone math, `playClick`), `keys.swift` (the key-state poller,
-the click queue, motor probe, stats), `talk.swift` (the `--talk` words, through nospeaker's voice engine),
-`settings.swift` (remembered settings) and `gui.swift` (the window and the menu bar item — plain AppKit, no
+the click queue, motor, stats), `settings.swift` (remembered settings) and `gui.swift` (the window and the menu bar item — plain AppKit, no
 Xcode project; `scripts/make-app.sh` wraps the binary into `Thockpad.app`, and `scripts/release.sh`
 publishes it to Releases).
 
@@ -142,7 +147,7 @@ publishes it to Releases).
 ```
 MacBook Pro 14" (MacBookPro18,3)  M1 Pro  macOS 27.0.1  app clicks keystrokes with zero permissions ✓
 poll loop                         ~170 passes/s (5.8 ms kernel sleep floor), ~1 % of one core ✓
-the app (window + menu bar)       close → menu bar, Try a click ✓, Exit ✓; second launch wakes the
+the app (window + menu bar)       close → menu bar, Exit ✓; second launch wakes the
                                   first instead of stacking a second engine ✓
 App Nap                           NSAppSleepDisabled + .latencyCritical (a napped poller = silent keys) ✓
 settings you change               persist to disk and reload ✓
@@ -168,7 +173,7 @@ upgrade that would remove the right-click→Open step for downloaded builds.
 
 - `MultitouchSupport` is private and undocumented; a macOS update can break this. (Upstream's caveat,
   inherited whole.)
-- thockpad stores only the settings you set in the window (profile, level, tocks, talk, paused) in
+- thockpad stores only the settings you set in the window (profile, level, tocks, paused) in
   `~/Library/Preferences/com.dkiiv.thockpad.settings.plist`. It cannot see what you type: key-state
   polling answers "which keys are down right now?" for at most a 2 ms slice of time, nothing is logged,
   and stats live in memory only.

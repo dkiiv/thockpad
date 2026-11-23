@@ -31,7 +31,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var levelSlider: NSSlider!
     var levelLabel: NSTextField!
     var releaseCheck: NSButton!
-    var talkCheck: NSButton!
     var pauseCheck: NSButton!
     var statusLabel: NSTextField!
     var blurbLabel: NSTextField!
@@ -40,7 +39,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var levelMenuItems: [String: NSMenuItem] = [:]
     var pauseMenuItem: NSMenuItem!
     var releaseMenuItem: NSMenuItem!
-    var talkMenuItem: NSMenuItem!
 
     var poll: Timer?
 
@@ -65,11 +63,10 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Open the motor and start listening. Idempotent — safe to call again if the first attempt failed
     /// (sleep/wake, trackpad unplug/replug).
     func startEngine() {
-        if motorProblem == nil { openMotorIfNeeded() }
+        if motorProblem == nil { discoverMotorIfNeeded() }
         if motorProblem == nil {
             startClickWorkerIfNeeded()
             startListeningIfNeeded()
-            Thread { warmVoice() }.start()   // synthesise the talk words off the main thread
         }
     }
 
@@ -138,8 +135,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         releaseMenuItem = toggleItem("Release “tock”", #selector(toggleRelease(_:)))
         menu.addItem(releaseMenuItem)
-        talkMenuItem = toggleItem("Talk while typing", #selector(toggleTalk(_:)))
-        menu.addItem(talkMenuItem)
         pauseMenuItem = toggleItem("Paused", #selector(togglePause(_:)))
         menu.addItem(pauseMenuItem)
         menu.addItem(.separator())
@@ -188,11 +183,8 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         levelLabel = label("", secondary: true)
 
         releaseCheck = check("Bottom-out “tock” on key release", #selector(toggleRelease(_:)))
-        talkCheck = check("Talk: say a word on space (nospeaker)", #selector(toggleTalk(_:)))
         pauseCheck = check("Paused", #selector(togglePause(_:)))
 
-        let try_ = NSButton(title: "Try a click", target: self, action: #selector(tryClick(_:)))
-        try_.bezelStyle = .rounded
 
         statusLabel = label("", secondary: true)
         statusLabel.maximumNumberOfLines = 3
@@ -206,9 +198,7 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             row("Click profile", profilePopup),
             row("Level", levelSlider, extra: levelLabel),
             releaseCheck,
-            talkCheck,
             pauseCheck,
-            try_,
             statusLabel,
         ])
         stack.orientation = .vertical
@@ -278,16 +268,8 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func slideLevel(_ sender: NSSlider) { gain = Float(sender.doubleValue); persist() }
     @objc func toggleRelease(_ sender: Any?) { releaseOn.toggle(); persist(); refresh() }
-    @objc func toggleTalk(_ sender: Any?) {
-        talkEnabled.toggle(); persist()
-        if talkEnabled { Thread { warmVoice(); DispatchQueue.main.async { [weak self] in self?.refresh() } }.start() }
-        refresh()
-    }
     @objc func togglePause(_ sender: Any?) { paused.toggle(); persist(); refresh() }
 
-    @objc func tryClick(_ sender: Any?) {
-        enqueue(Click(tones: clickTones(for: spaceCode, at: now()), level: gain, at: now()))
-    }
     @objc func restartApp(_ sender: Any?) {
         // Relaunch this same bundle — but only after this process is gone, so the new instance can never
         // stack on top of the old one (two pollers = every key thocks twice) and can never see the old one
@@ -323,7 +305,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         levelSlider.doubleValue = Double(gain)
         levelLabel.stringValue = String(format: "%.2f", gain)
         releaseCheck.state = releaseOn ? .on : .off
-        talkCheck.state = talkEnabled ? .on : .off
         pauseCheck.state = paused ? .on : .off
         for (name, item) in profileMenuItems { item.state = name == profileName ? .on : .off }
         var nearest = Self.levels[0].0
@@ -334,7 +315,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         for (label, item) in levelMenuItems { item.state = label == nearest ? .on : .off }
         releaseMenuItem.state = releaseOn ? .on : .off
-        talkMenuItem.state = talkEnabled ? .on : .off
         pauseMenuItem.state = paused ? .on : .off
         statusItem.button?.appearsDisabled = paused
 

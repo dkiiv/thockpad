@@ -22,7 +22,6 @@ func help() -> Never {
       --profile <name>                \(profileOrder.joined(separator: ", ")) (default “thock”)
       --level <0.1-1>                 how loud a click is
       --no-release                    press clicks only, no bottom-out tock
-      --talk                          the trackpad talks while you type
       --verbose                       print each key as it clicks
       --chatter                       print a startup line (silent otherwise)
       --selftest                      start listening, prove a keypress clicks, then report
@@ -84,7 +83,6 @@ if let l = option("--level", "0.6") {
     gain = v
 }
 if takeFlag("--no-release") { releaseOn = false }
-if takeFlag("--talk") { talkEnabled = true }
 verbose = takeFlag("--verbose")
 chatter = takeFlag("--chatter") || verbose
 let wantsSelfTest = takeFlag("--selftest")

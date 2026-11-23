@@ -28,7 +28,7 @@ set -- $version
 
 mkdir -p build
 ENGINE="nospeaker/engine.swift"
-THOCK="clicks.swift keys.swift talk.swift settings.swift gui.swift main.swift"
+THOCK="clicks.swift keys.swift settings.swift gui.swift main.swift"
 
 build_for() {   # build_for <target> <out-suffix> [extra swiftc flags…]
     target="$1"; suffix="$2"; shift 2

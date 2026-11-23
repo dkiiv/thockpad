@@ -37,9 +37,9 @@ let spaceCode = 49, returnCode = 36, deleteCode = 51
 struct Click {
     var tones: [Tone]
     var level: Float
-    var word: String? = nil
     var priority = true
     var at = 0.0              // when the key edge happened, so a click that can't play soon is dropped
+    var fromKeyboard = false  // THE GATE: nothing else may move the motor
 }
 
 /// How long a click may be late and still be played, in seconds. A click is a *reaction*: past this the
@@ -131,15 +131,32 @@ func startClickWorkerIfNeeded() {
                 continue
             }
             let age = now() - click.at
+            let fromKeys = click.fromKeyboard
             clickLock.unlock()
+            // The invariant, enforced here rather than by convention: the trackpad makes a sound when a
+            // keyboard key is pressed, and never for anything else — not launch, not a window opening, not
+            // a menu, not a wake-up, not a word. Any click that arrives without a keystroke behind it is
+            // discarded silently, so a future feature cannot make the app talk to itself by accident.
+            guard fromKeys else {
+                if verbose { report("(click ignored: not from the keyboard)") }
+                continue
+            }
             // Late is wrong: only play a click while it still feels like it belongs to the keystroke.
             if age > staleClickSeconds {
                 statsLock.lock(); stats.late += 1; statsLock.unlock()
                 if verbose { report("✗ dropped, \(Int(age * 1000)) ms late") }
                 continue
             }
+            // First real keystroke: now, and not a moment sooner, claim the actuator. `MTActuatorOpen` makes
+            // the trackpad fire its own detent thump, so it is deliberately left until a key has been
+            // pressed — that way the claim sound arrives as part of a thock instead of announcing the app.
+            if motor == nil { claimMotorIfNeeded() }
+            guard motor != nil else {
+                // Still no motor: nothing to play on. Drop silently (the window says why).
+                statsLock.lock(); stats.noMotor += 1; statsLock.unlock()
+                continue
+            }
             playClick(click.tones, at: click.level)
-            if let word = click.word { queueWord(word) }
         }
     }
     thread.qualityOfService = .userInteractive
@@ -150,7 +167,7 @@ func startClickWorkerIfNeeded() {
 // MARK: - Stats
 
 struct Stats {
-    var heard = 0, down = 0, up = 0, throttled = 0, spoken = 0, tocksDropped = 0, late = 0
+    var heard = 0, down = 0, up = 0, throttled = 0, tocksDropped = 0, late = 0, noMotor = 0
     var first = -1.0, last = -1.0, active = 0.0
     var lastKey = ""            // name of the most recent key press seen
     var lastKeyAt = 0.0
@@ -158,12 +175,18 @@ struct Stats {
 let statsLock = NSLock()
 var stats = Stats()
 
-// MARK: - The motor, checked without exiting
+// MARK: - The motor: discovered at launch, opened on the first keystroke
 
 /// Why the trackpad can't click, or nil when it can. nospeaker's openMotor() explains problems well but
-/// exits the process — right for a CLI error, wrong for a GUI window — so this mirrors its probe and
-/// reports instead. Opens the actuator as a side effect. (Driving the motor needs no approval — the
-/// private MultitouchSupport calls are not a TCC service.)
+/// exits the process — right for a CLI error, wrong for a GUI window — so this mirrors its probe and reports
+/// instead.
+///
+/// It deliberately does NOT open the actuator. `MTActuatorOpen` claims the haptic device, and claiming a
+/// Force Touch trackpad makes it fire its own detent thump — a sound with no keystroke behind it, emitted by
+/// the driver rather than by MTActuationActuate, which is why it never appeared in the actuation log and why
+/// it survived every "start silent" change. thockpad may move that glass for one reason only: a key was
+/// pressed. So launch just finds the device; `claimMotorIfNeeded()` is called by the click worker when it has a real
+/// click to play.
 func motorCheck() -> String? {
     if motor != nil { return nil }
     guard createList != nil, getID != nil, actuatorCreate != nil, actuatorOpen != nil,
@@ -182,20 +205,36 @@ func motorCheck() -> String? {
         if getID!(dev, &id) == 0 { ids.append((id, isBuiltIn?(dev) ?? false)) }
     }
     for d in ids.sorted(by: { $0.builtIn && !$1.builtIn }) {
-        if let ref = actuatorCreate!(d.id)?.takeRetainedValue(), actuatorOpen!(ref) == 0 {
-            motorDeviceID = d.id
-            motor = ref
-            motorPointer = Unmanaged.passUnretained(ref as AnyObject).toOpaque()
-            return nil
-        }
+        // Create without Open: it tells us this device has an actuator, and stays silent.
+        guard let ref = actuatorCreate!(d.id)?.takeRetainedValue() else { continue }
+        motorCandidate = ref
+        motorDeviceID = d.id
+        return nil
     }
     return "Found a trackpad, but it has no haptic motor (Force Touch), so it can't click."
 }
 
-/// nil when the motor is open and ready; sets motorProblem so callers (and the GUI) can say why not.
+/// The actuator we found but have not claimed yet. Released with the process if no key is ever pressed.
+nonisolated(unsafe) var motorCandidate: CFTypeRef?
+
+/// Claim the actuator so clicks can play. Called from the click worker, on a click caused by a real
+/// keystroke, so the claim's own detent thump arrives as part of a thock and never on its own.
 var motorProblem: String?
-func openMotorIfNeeded() {
-    if motor == nil { motorProblem = motorCheck() }
+func claimMotorIfNeeded() {
+    guard motor == nil, let candidate = motorCandidate else { return }
+    if actuatorOpen?(candidate) == 0 {
+        motor = candidate
+        motorPointer = Unmanaged.passUnretained(candidate as AnyObject).toOpaque()
+        motorProblem = nil
+    } else {
+        motorProblem = "Couldn't take over the trackpad's haptic motor — another app may be using it. Close the other app and press a key again."
+    }
+}
+
+/// nil when a motor has been found (still unopened, still silent); sets motorProblem so callers (and the
+/// GUI) can say why not.
+func discoverMotorIfNeeded() {
+    if motor == nil && motorCandidate == nil { motorProblem = motorCheck() }
 }
 
 // MARK: - Listening: poll the key state
@@ -280,10 +319,7 @@ func pollKeys() {
                 let tones = clickTones(for: code, at: t)
                 if claimMotor(at: t, seconds: clickSeconds(tones)) {
                     if verbose { report("↓ \(keyName(code))") }
-                    let word: String? = talkEnabled
-                        ? (code == spaceCode ? wordBank.randomElement() : code == returnCode ? finishers.randomElement() : nil)
-                        : nil
-                    enqueue(Click(tones: tones, level: gain, word: word, at: t))
+                    enqueue(Click(tones: tones, level: gain, at: t, fromKeyboard: true))
                     statsLock.lock()
                     if stats.first < 0 { stats.first = t }
                     if stats.last > 0, t - stats.last < 1.0 { stats.active += t - stats.last }
@@ -304,7 +340,7 @@ func pollKeys() {
                 if verbose { report("↑") }
                 // A tock never blocks and is never queued ahead of a press: it fills spare motor time, and
                 // is the first thing dropped when presses need the slot.
-                enqueue(Click(tones: tones, level: gain * Float(currentProfile.release), priority: false, at: now()))
+                enqueue(Click(tones: tones, level: gain * Float(currentProfile.release), priority: false, at: now(), fromKeyboard: true))
                 statsLock.lock(); stats.up += 1; statsLock.unlock()
             }
         }
@@ -319,17 +355,16 @@ func printStatus() {
     statsLock.lock(); let s = stats; statsLock.unlock()
     let rate = s.active > 0 ? Double(s.down) / s.active : 0
     report("""
-    thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(talkEnabled ? " · talking" : "")\(paused ? " · PAUSED" : "")
-    \(s.heard) keys heard → \(s.down) clicks (\(s.throttled) refused, \(s.late) too late), \(s.up) tocks (\(s.tocksDropped) skipped), \(s.spoken) words · \(String(format: "%.1f", rate)) keys/second
+    thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(paused ? " · PAUSED" : "")
+    \(s.heard) keys heard → \(s.down) clicks (\(s.throttled) refused, \(s.late) too late), \(s.up) tocks (\(s.tocksDropped) skipped) · \(String(format: "%.1f", rate)) keys/second
     poll loop: worst gap \(String(format: "%.0f", pollHealth().worst * 1000)) ms (\(pollHealth().worst < pollStallSeconds ? "healthy" : "STALL — something is throttling thockpad"))
     ctrl-c stops it (or kill -USR1 \(getpid()) prints this).
     """)
 }
 
 func runThockpad() -> Int32 {
-    openMotorIfNeeded()
+    discoverMotorIfNeeded()
     if let problem = motorProblem { report("thockpad: \(problem)"); return 2 }
-    warmVoice()   // synthesise the word bank up front, so the first space bar is not slow
     startClickWorkerIfNeeded()
     startListeningIfNeeded()
     installExitSignals()
@@ -373,7 +408,7 @@ func startTimer(_ seconds: Double) {
 /// `--selftest --post-keys` (opt-in) additionally posts a space + delete pair through the HID system —
 /// they cancel out in any text field — to prove the poll sees even synthetic keys.
 func selfTest(postKeys: Bool = false) -> Int32 {
-    openMotorIfNeeded()
+    discoverMotorIfNeeded()
     if let problem = motorProblem { report("self-test: \(problem)"); return 2 }
     startClickWorkerIfNeeded()
     startListeningIfNeeded()

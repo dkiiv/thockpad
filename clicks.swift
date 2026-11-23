@@ -53,7 +53,6 @@ var releaseOn = true            // the bottom-out “tock” on key-up
 var paused = false              // the GUI's pause: the poller keeps running, nothing clicks
 var throttleSeconds = 0.015     // actuations can't overlap: 15 ms is the floor for a clean click
                                 // (press edges only — a key-release tock is a separate click, always played)
-var talkEnabled = false
 var verbose = false
 // thockpad starts silent: no click, no greeting, nothing on the terminal. --chatter opts in to the startup
 // line, --verbose prints each key. Errors and the kill -USR1 status always print, through report().
