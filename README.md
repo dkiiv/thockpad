@@ -9,10 +9,14 @@ can make *sounds*, not just clicks. thockpad uses that as an engine: no sample f
 device. One or two sine tones, a few milliseconds each, straight to the motor.
 
 ```
-        ┌────────────┐   CGEventTap   ┌────────────┐   MultitouchSupport   ┌─────────┐
-keys ──▶│ your Mac   │───────────────▶│ thockpad   │──────────────────────▶│ motor   │──▶ thock
-        └────────────┘  key down/up   │ 15 ms gate │   2 tones / click     └─────────┘
+        ┌────────────┐  key state 2 ms  ┌────────────┐   MultitouchSupport   ┌─────────┐
+keys ──▶│ your Mac   │────────────────▶│ thockpad   │──────────────────────▶│ motor   │──▶ thock
+        └────────────┘  polls, no tap  │ 15 ms gate │   2 tones / click     └─────────┘
 ```
+
+**thockpad needs no permissions at all.** It reads Apple's key-state API (`CGEventSource.keyState`) 500× a
+second and clicks on the edges — that query is not Input Monitoring, so nothing to allow in System
+Settings, nothing that can break between rebuilds, nothing that touches your keystrokes. Install and type.
 
 ## Download
 
@@ -20,8 +24,9 @@ keys ──▶│ your Mac   │───────────────▶
 download `Thockpad.zip`, unzip, and open **Thockpad.app**.
 
 > The build is signed ad-hoc (no Apple Developer ID), so macOS won't open it with a double-click the first
-> time: **right-click the app → Open → Open**. That's a one-time thing for this build.
-> Needs an Apple Silicon MacBook with a Force Touch trackpad (2015+) on macOS 12 or newer.
+> time: **right-click the app → Open → Open**. That's a one-time thing for this build — the *only* prompt
+> thockpad ever gives you.
+> Needs a MacBook with a Force Touch trackpad (2015+) on macOS 12 or newer.
 
 ## Run it
 
@@ -30,8 +35,8 @@ Open **Thockpad.app**. A window appears and your next keystroke clicks.
 - **The red X does not quit.** The window closes, the Dock icon disappears, and thockpad keeps clicking
   from the **menu bar** (a small keyboard icon, top right). Open the menu there to switch profiles, set the
   level, pause, or **Exit thockpad** — the only way it stops.
-- The first launch asks for **Input Monitoring**: allow it in the System Settings pane that opens, then
-  *Restart thockpad* from the menu bar item (a fresh grant only applies to a new process).
+- No permission prompts, then or ever. If the window says it can't find a trackpad motor, that's hardware,
+  not settings.
 - Everything you set is remembered for the next launch.
 - Mute the Mac — the sound comes out of the trackpad glass. On a table it's much louder than on your lap.
 
@@ -55,9 +60,8 @@ The same engine without a window, for scripts and testing:
 ./build/thockpad --level 0.6              # quieter
 ./build/thockpad --no-release             # no bottom-out tock
 ./build/thockpad --talk                   # says a word on space, "done" on return (via nospeaker)
-./build/thockpad --swallow                # your real typing goes nowhere, only clicks (testing!)
 ./build/thockpad --verbose --chatter      # print each key + startup line
-./build/thockpad --selftest               # one synthetic keypress, proves the click loop
+./build/thockpad --selftest               # start listening, prove a keypress clicks, then report
 ./build/thockpad --run 60                 # quit by itself after 60 s and print stats
 ./build/nospeaker "hello"                 # the parent project: the trackpad talks
 ```
@@ -87,13 +91,14 @@ stretch, because big keys sound bigger. A key-up adds a quieter, lower "tock".
 
 Two engineering notes:
 
-- **15 ms floor.** The motor can't mix two actuations, and nospeaker restarts it per call. Anything within
-  15 ms of the previous click is dropped rather than queued (the queue itself is capped at 3 clicks) —
+- **15 ms floor.** The motor can't mix two actuations, and nospeaker restarts it per call. A press within
+  15 ms of the previous *press* is dropped rather than queued (the queue itself is capped at 3 clicks) —
   holding a key or pasting a paragraph stays in time and never backs up.
-- **The tap is passive by default.** thockpad listens at the session event tap and passes every event
-  through, so typing latency is untouched and nothing about your Mac changes. `--swallow` (which drops
-  key-downs so only the clicks happen — good for hearing a single profile cleanly) never drops key-*up*s:
-  a lost release sticks modifiers.
+- **Watching, not tapping.** `CGEventSource.keyState` answers "is this key down right now?" for every
+  physical key without Input Monitoring, and it can't interfere with typing — thockpad only reads state.
+  Polling all 128 keycodes every 2 ms costs a few percent of one M1 core and tracks keystrokes edge for
+  edge (measured: 9 synthetic keystrokes → 9 presses heard → 8 motor actuations, the miss being the 15 ms
+  floor; the poll probe tracked live typing keystroke-for-keystroke).
 
 ## The fork
 
@@ -107,20 +112,28 @@ Two engineering notes:
    *lazy* global in a non-`main.swift` file traps (SIGTRAP, no message) on first read — reproduced in a
    20-line two-file case; eager init from the entry point works.
 
-thockpad's own files: `clicks.swift` (profiles, tone math, `playClick`), `keys.swift` (event tap,
-permission, stats), `talk.swift` (the `--talk` words, through nospeaker's voice engine),
+thockpad's own files: `clicks.swift` (profiles, tone math, `playClick`), `keys.swift` (the key-state poller,
+the click queue, motor probe, stats), `talk.swift` (the `--talk` words, through nospeaker's voice engine),
 `settings.swift` (remembered settings) and `gui.swift` (the window and the menu bar item — plain AppKit, no
 Xcode project; `scripts/make-app.sh` wraps the binary into `Thockpad.app`, and `scripts/release.sh`
 publishes it to Releases).
 
+> **Why polling, not an event tap.** The first version of thockpad used `CGEvent.tapCreate`, which needs
+> Input Monitoring. In practice that turned out to be a trap: ad-hoc-signed binaries are pinned to a cdhash
+> that changes every build, so grants strand on every recompile, prompts get suppressed after a few cycles,
+> and the box ticks without ever working. Apple's key-state query does the same job — know every key that
+> goes down and up — with no permission, no prompt, and no state that can go stale between builds.
+
 ## Tested on
 
 ```
-MacBook Pro 14" (MacBookPro18,3)   M1 Pro   macOS 27.0.1   177 real keystrokes → clicks ✓ (5 keys/s, 12 throttled)
-the app (window + menu bar)        close → menu bar, Try a click → 2 actuations ✓, Exit → quit ✓
-settings you change                persist to disk and reload ✓
-nospeaker (upstream show)          still builds and talks from the split engine        ✓
-Input Monitoring grant             survives rebuilds with a new cdhash (signed id)     ✓
+MacBook Pro 14" (MacBookPro18,3)  M1 Pro  macOS 27.0.1  app clicks keystrokes with zero permissions ✓
+poller                            9 injected keystrokes → 9 presses heard → 8 motor actuations ✓ (15 ms floor)
+                                  ~2.7 % CPU idle-polling 128 keys every 2 ms
+the app (window + menu bar)       close → menu bar, Try a click ✓, Exit ✓
+settings you change               persist to disk and reload ✓
+nospeaker (upstream show)         still builds and talks from the split engine ✓
+Input Monitoring                  not needed, not asked for, not in the code anymore
 ```
 
 Not tested: Intel Macs, Magic Trackpad, other macOS versions — same caveats as upstream, since it's the
@@ -141,9 +154,10 @@ upgrade that would remove the right-click→Open step for downloaded builds.
 
 - `MultitouchSupport` is private and undocumented; a macOS update can break this. (Upstream's caveat,
   inherited whole.)
-- thockpad needs Input Monitoring to hear the keyboard. It stores only the settings you set in the window
-  (profile, level, tocks, talk, swallow, paused) in `~/Library/Preferences/com.dkiiv.thockpad.settings.plist`;
-  keystrokes and stats live in memory only.
+- thockpad stores only the settings you set in the window (profile, level, tocks, talk, paused) in
+  `~/Library/Preferences/com.dkiiv.thockpad.settings.plist`. It cannot see what you type: key-state
+  polling answers "which keys are down right now?" for at most a 2 ms slice of time, nothing is logged,
+  and stats live in memory only.
 - The motor is never driven past its normal maximum strength — same rule as upstream.
 
 ## License

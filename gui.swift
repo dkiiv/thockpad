@@ -5,8 +5,8 @@
 // app keeps clicking from the menu bar until you choose Exit there.
 //
 // Deliberately AppKit-only, no SwiftUI and no .xcodeproj: ./build.sh stays one swiftc call plus a bundle
-// folder. The event tap is added to the main run loop, which NSApp.run() pumps — that is also what makes the
-// tap deliver keys at all (see the note in runThockpad()).
+// folder. Nothing here asks macOS for anything: key-state polling needs no permission, so there is no
+// grant dance, no "Restart after allowing" button, no status text about System Settings. Open it and type.
 
 import AppKit
 
@@ -32,11 +32,9 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var levelLabel: NSTextField!
     var releaseCheck: NSButton!
     var talkCheck: NSButton!
-    var swallowCheck: NSButton!
     var pauseCheck: NSButton!
     var statusLabel: NSTextField!
     var blurbLabel: NSTextField!
-    var permButton: NSButton!
     var statsMenuItem: NSMenuItem!
     var profileMenuItems: [String: NSMenuItem] = [:]
     var levelMenuItems: [String: NSMenuItem] = [:]
@@ -58,16 +56,20 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildWindow()
         showWindow(nil)
 
-        motorProblem = motorCheck()
-        // If macOS doesn't trust this app yet, ask properly: this shows the system prompt once and puts
-        // Thockpad in the Input Monitoring list so it can be switched on. The window explains what to do.
-        if !inputMonitoringGranted() {
-            let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            _ = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
-        }
-        applySettingsToEngine()                 // start clicking if macOS already trusts us
+        startEngine()
         poll = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.refresh()
+        }
+    }
+
+    /// Open the motor and start listening. Idempotent — safe to call again if the first attempt failed
+    /// (sleep/wake, trackpad unplug/replug).
+    func startEngine() {
+        if motorProblem == nil { openMotorIfNeeded() }
+        if motorProblem == nil {
+            startClickWorkerIfNeeded()
+            startListeningIfNeeded()
+            Thread { warmVoice() }.start()   // synthesise the talk words off the main thread
         }
     }
 
@@ -168,7 +170,7 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func buildWindow() {
         let width: CGFloat = 420
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 420),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 380),
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered, defer: false)
         window.title = "thockpad"
@@ -187,16 +189,10 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         releaseCheck = check("Bottom-out “tock” on key release", #selector(toggleRelease(_:)))
         talkCheck = check("Talk: say a word on space (nospeaker)", #selector(toggleTalk(_:)))
-        swallowCheck = check("Swallow my keystrokes (typing goes nowhere — testing)", #selector(toggleSwallow(_:)))
         pauseCheck = check("Paused", #selector(togglePause(_:)))
 
         let try_ = NSButton(title: "Try a click", target: self, action: #selector(tryClick(_:)))
         try_.bezelStyle = .rounded
-        let settings = NSButton(title: "Open Input Monitoring…", target: self, action: #selector(openSettings(_:)))
-        settings.bezelStyle = .rounded
-        permButton = settings
-        let quit = NSButton(title: "Exit thockpad", target: self, action: #selector(exitApp(_:)))
-        quit.bezelStyle = .rounded
 
         statusLabel = label("", secondary: true)
         statusLabel.maximumNumberOfLines = 3
@@ -211,11 +207,9 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             row("Level", levelSlider, extra: levelLabel),
             releaseCheck,
             talkCheck,
-            swallowCheck,
             pauseCheck,
-            NSStackView(views: [try_, permButton]),
+            try_,
             statusLabel,
-            quit,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -265,20 +259,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applySettingsToEngine() {
         setProfile(profileName)
         throttleSeconds = 0.015
-        if let problem = motorProblem {
-            status(label: problem)
-            return
-        }
-        openMotorIfNeeded()
-        startClickWorkerIfNeeded()
-        if inputMonitoringGranted() {
-            if eventTap == nil { startClickWorkerIfNeeded(); _ = startTap() }
-            status(label: tapRunning ? "Clicking — type on your Mac. Closing this window keeps it running in the menu bar."
-                                     : "The keyboard tap wouldn’t open. Try Restart thockpad.")
-        } else {
-            status(label: "thockpad can’t hear your keyboard yet: allow it in Input Monitoring, then press "
-                        + "“Restart thockpad” (a new grant only applies to a newly started process).")
-        }
     }
 
     func persist() { saveSettings() }
@@ -303,18 +283,10 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if talkEnabled { Thread { warmVoice(); DispatchQueue.main.async { [weak self] in self?.refresh() } }.start() }
         refresh()
     }
-    @objc func toggleSwallow(_ sender: Any?) {
-        swallowKeys.toggle()
-        // listen-only vs filtering is a property of the tap itself: rebuild it.
-        stopTap(); applySettingsToEngine(); persist(); refresh()
-    }
     @objc func togglePause(_ sender: Any?) { paused.toggle(); persist(); refresh() }
 
     @objc func tryClick(_ sender: Any?) {
         enqueue(Click(tones: clickTones(for: spaceCode, at: now()), level: gain))
-    }
-    @objc func openSettings(_ sender: Any?) {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
     }
     @objc func restartApp(_ sender: Any?) {
         let task = Process()
@@ -325,18 +297,16 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func exitApp(_ sender: Any?) { NSApp.terminate(nil) }
 
-    func status(label s: String) { statusString = s }
-
     // MARK: - Refresh
 
-    var statusString = ""
     var lastDown = 0
 
     /// Half-secondly: sync controls, menu checks, and the stats line. Cheap enough to leave running.
     func refresh() {
+        applySettingsToEngine()
         statsLock.lock(); let s = stats; statsLock.unlock()
         let rate = s.active > 0 ? Double(s.down) / s.active : 0
-        let state = paused ? "paused" : (tapRunning ? "clicking" : "not clicking")
+        let state = paused ? "paused" : (listening ? "listening" : "not listening")
         let line = "\(state) · \(profileName) · level \(String(format: "%.2f", gain)) · \(s.down) presses"
             + (s.throttled > 0 ? " · \(s.throttled) too fast" : "")
             + (rate > 0 ? String(format: " · %.1f keys/s", rate) : "")
@@ -348,7 +318,6 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         levelLabel.stringValue = String(format: "%.2f", gain)
         releaseCheck.state = releaseOn ? .on : .off
         talkCheck.state = talkEnabled ? .on : .off
-        swallowCheck.state = swallowKeys ? .on : .off
         pauseCheck.state = paused ? .on : .off
         for (name, item) in profileMenuItems { item.state = name == profileName ? .on : .off }
         var nearest = Self.levels[0].0
@@ -362,12 +331,17 @@ final class GUIController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         talkMenuItem.state = talkEnabled ? .on : .off
         pauseMenuItem.state = paused ? .on : .off
         statusItem.button?.appearsDisabled = paused
-        if tapRunning {
-            statusLabel.stringValue = "Clicking — type on your Mac. Closing this window keeps thockpad running in the menu bar."
+
+        if let problem = motorProblem {
+            statusLabel.stringValue = problem + "  (Fix it and press Restart thockpad.)"
+            startEngine()          // retry: cheap, and heals sleep/wake and replug
+        } else if s.down > 0 {
+            statusLabel.stringValue = "Clicking — heard \(s.down) keystrokes, last was “\(s.lastKey)”. "
+                + "Closing this window keeps thockpad running in the menu bar."
         } else {
-            statusLabel.stringValue = statusString.isEmpty ? "Not clicking yet." : statusString
+            statusLabel.stringValue = "Clicking — type on your Mac and the trackpad thocks. "
+                + "Closing this window keeps thockpad running in the menu bar."
         }
-        // A grant can arrive while we run (it does on some macOS versions); notice it and start.
-        if !tapRunning && motorProblem == nil && inputMonitoringGranted() { applySettingsToEngine() }
+        lastDown = s.down
     }
 }

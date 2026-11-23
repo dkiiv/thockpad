@@ -21,17 +21,16 @@ func help() -> Never {
       --profile <name>                \(profileOrder.joined(separator: ", ")) (default “thock”)
       --level <0.1-1>                 how loud a click is
       --no-release                    press clicks only, no bottom-out tock
-      --swallow                       your real typing goes nowhere: only the clicks (testing)
       --talk                          the trackpad talks while you type
       --verbose                       print each key as it clicks
       --chatter                       print a startup line (silent otherwise)
-      --selftest                      one synthetic keypress, then report
+      --selftest                      start listening, prove a keypress clicks, then report
       --run <seconds>                 quit by itself after this long and print stats (for testing)
       --list                          the click profiles
       --help, -h                      this
 
     Ctrl-C stops the CLI. kill -USR1 <pid> prints how you're doing.
-    Needs Input Monitoring: macOS asks on the first run, then start thockpad again.
+    Needs nothing: no permissions, no System Settings, nothing to approve.
     Mute the Mac — the sound comes out of the trackpad glass. A table beats a lap.
     """)
     exit(0)
@@ -85,10 +84,10 @@ if let l = option("--level", "0.6") {
 }
 if takeFlag("--no-release") { releaseOn = false }
 if takeFlag("--talk") { talkEnabled = true }
-if takeFlag("--swallow") { swallowKeys = true }
 verbose = takeFlag("--verbose")
 chatter = takeFlag("--chatter") || verbose
 let wantsSelfTest = takeFlag("--selftest")
+let postKeys = takeFlag("--post-keys")     // undocumented: prove the poll sees synthetic keys too
 var runSeconds = 0.0
 if let n = option("--run", "20") {
     guard let v = Double(n), v > 0, v <= 3600 else { die("--run wants seconds, like: --run 20") }
@@ -102,4 +101,4 @@ if !args.isEmpty { die("thockpad doesn't take words — it clicks. (nospeaker is
 if bare { runGUI() }
 
 if runSeconds > 0 { chatter = true; startTimer(runSeconds) }
-exit(wantsSelfTest ? selfTest() : runThockpad())
+exit(wantsSelfTest ? selfTest(postKeys: postKeys) : runThockpad())

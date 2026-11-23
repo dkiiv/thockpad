@@ -50,9 +50,9 @@ var profileName = "thock"
 var currentProfile = profiles["thock"]!
 var gain: Float = 0.85          // overall click loudness (motor is never driven past its normal maximum)
 var releaseOn = true            // the bottom-out “tock” on key-up
-var passThrough = true          // false = swallow key events (--swallow / the GUI checkbox)
-var paused = false              // the GUI's pause: the tap keeps running, nothing clicks, keys stay normal
+var paused = false              // the GUI's pause: the poller keeps running, nothing clicks
 var throttleSeconds = 0.015     // actuations can't overlap: 15 ms is the floor for a clean click
+                                // (press edges only — a key-release tock is a separate click, always played)
 var talkEnabled = false
 var verbose = false
 // thockpad starts silent: no click, no greeting, nothing on the terminal. --chatter opts in to the startup
@@ -61,7 +61,6 @@ var chatter = false
 func report(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
 func setProfile(_ name: String) { profileName = name; currentProfile = profiles[name]! }
-var swallowKeys: Bool { get { !passThrough } set { passThrough = !newValue } }
 
 /// Startup chatter only (--chatter / --verbose): the daemon must be silent without it.
 func say(_ s: String) { if chatter { report(s) } }

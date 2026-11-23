@@ -4,9 +4,10 @@
 #   ./build.sh              build ./build/thockpad and ./build/nospeaker (this Mac)
 #   ./build.sh universal    the same, fat arm64 + x86_64 (needs both SDK targets)
 #
-# Each build is signed ad-hoc with a stable identifier, which is what makes an Input Monitoring grant
-# survive recompiling (see scripts/permissions.sh). Upstream's notarized-release flow lives in the
-# nospeaker repo; this fork builds locally and runs the binary from ./build.
+# Each build is signed ad-hoc with a stable identifier — that is only for tidiness (a named binary in
+# spctl/codesign output). thockpad needs NO macOS permission: it polls key state instead of tapping events,
+# so there is no grant to survive. Upstream's notarized-release flow lives in the nospeaker repo; this fork
+# builds locally and runs the binary from ./build.
 #
 # Two binaries from one engine: nospeaker/engine.swift holds only declarations, so it compiles with either
 # entry point — main.swift (thockpad) or nospeaker/main.swift (the original show).
@@ -55,8 +56,8 @@ universal)
     ;;
 esac
 
-# An ad-hoc signature with a fixed identifier, so an Input Monitoring grant survives rebuilding the file.
-# (See scripts/permissions.sh — that also prints what to click.)
+# An ad-hoc signature with a fixed identifier (cosmetic: names the binary in codesign output). No
+# permission depends on it — thockpad asks macOS for nothing.
 codesign --force --sign - --identifier com.dkiiv.thockpad build/thockpad 2>/dev/null || true
 codesign --force --sign - --identifier com.dkiiv.nospeaker build/nospeaker 2>/dev/null || true
 

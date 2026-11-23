@@ -4,9 +4,8 @@
 #   ./scripts/make-app.sh            build/thockpad → build/Thockpad.app (ad-hoc signed, stable identifier)
 #   ./scripts/make-app.sh --zip      …and dist/Thockpad.zip, ready to upload to a GitHub release
 #
-# The bundle matters beyond looks: Input Monitoring is granted per *code identity*, and a bare binary has no
-# bundle identifier of its own. Thockpad.app/Contents/Info.plist pins com.dkiiv.thockpad, and the binary is
-# signed with it, so the grant survives rebuilds and the app appears with a proper name in the settings list.
+# The bundle matters beyond looks: a proper app with an icon, a name, and a Dock presence. (It is NOT about
+# permissions — thockpad needs none; the stable identifier just keeps codesign output honest.)
 #
 # It is NOT notarized (that needs a Developer ID + notary credentials, upstream nospeaker's release flow):
 # a downloaded build/Thockpad.zip opens with a right-click → Open the first time, because macOS doesn't

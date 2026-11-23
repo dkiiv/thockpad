@@ -1,16 +1,17 @@
-// thockpad — listening to the keyboard, and the click worker behind it.
+// thockpad — hearing the keyboard WITHOUT asking for anything.
 //
-// A CGEventTap watches key down/up events. The callback does as little as possible (timestamp, shape the
-// tones, push them onto a queue) and a single worker thread plays them, so typing latency never depends on
-// the motor. With --swallow the callback returns nil instead of the event, so the Mac never sees the key;
-// without it (the default) events pass through untouched and thockpad only adds sound.
+// CGEventSource.keyState(.combinedSessionState, key:) answers “is this key down right now?” for every
+// physical key — and unlike a CGEventTap, it is not gated behind Input Monitoring (proven on this Mac:
+// real typing seen from an ungranted, ad-hoc-signed process). So thockpad polls all 128 keycodes every
+// 2 ms and clicks on the edges: down → click, up → optional tock. That means: no system settings, no
+// checkboxes, no cdhash grief, nothing to approve — install and type.
 //
-// Needs Input Monitoring (Accessibility): macOS prompts on first run, and a fresh grant only applies to a
-// newly started process.
+// Polling also improves the feel: one click per physical press (holding a key never auto-repeats the
+// click), and thockpad cannot interfere with your typing at all — it only watches state.
 //
-// The GUI drives the same functions (startTap/stopTap/motorCheck); runThockpad() is the CLI's loop.
+// The click worker, stats, and motor plumbing are the same as before; the event tap and Input Monitoring
+// code are gone for good. (--swallow went with them: thockpad never touches your keystrokes now.)
 
-import AppKit
 import CoreGraphics
 import Foundation
 
@@ -23,10 +24,10 @@ let keyNames: [Int: String] = [
     35: "p", 37: "l", 38: "j", 39: "'", 40: "k", 41: ";", 42: "\\", 43: ",", 44: "/", 45: "n", 46: "m",
     47: ".", 50: "`", 49: "space", 36: "return", 48: "tab", 51: "delete", 53: "esc",
     54: "cmd-r", 55: "cmd", 56: "shift", 57: "caps", 58: "option", 59: "control", 60: "shift-r",
-    76: "enter", 123: "left", 124: "right", 125: "down", 126: "up",
+    63: "fn", 76: "enter", 123: "left", 124: "right", 125: "down", 126: "up",
 ]
 func keyName(_ code: Int) -> String { keyNames[code] ?? "key\(code)" }
-let spaceCode = 49, returnCode = 36
+let spaceCode = 49, returnCode = 36, deleteCode = 51
 
 // MARK: - The click queue
 
@@ -59,7 +60,7 @@ func startClickWorkerIfNeeded() {
     workerLock.lock(); defer { workerLock.unlock() }
     guard !workerStarted else { return }
     workerStarted = true
-    Thread {
+    let thread = Thread {
         while !stopRequested {
             clickSemaphore.wait()
             if stopRequested { return }
@@ -70,7 +71,10 @@ func startClickWorkerIfNeeded() {
             playClick(click.tones, at: click.level)
             if let word = click.word { queueWord(word) }
         }
-    }.start()
+    }
+    thread.qualityOfService = .userInteractive
+    thread.name = "thockpad-clicks"
+    thread.start()
 }
 
 // MARK: - Stats
@@ -78,18 +82,21 @@ func startClickWorkerIfNeeded() {
 struct Stats {
     var down = 0, up = 0, throttled = 0, spoken = 0
     var first = -1.0, last = -1.0, active = 0.0
+    var lastKey = ""            // name of the most recent key press seen
+    var lastKeyAt = 0.0
 }
 let statsLock = NSLock()
 var stats = Stats()
 
 // MARK: - The motor, checked without exiting
 
-/// Why the trackpad can't click, or nil when it can. openMotor() (from nospeaker) explains problems well
-/// but exits the process — right for the CLI, wrong for a GUI window, so this mirrors its probe and reports
-/// instead of exiting. Opens the actuator as a side effect.
+/// Why the trackpad can't click, or nil when it can. nospeaker's openMotor() explains problems well but
+/// exits the process — right for a CLI error, wrong for a GUI window — so this mirrors its probe and
+/// reports instead. Opens the actuator as a side effect. (Driving the motor needs no approval — the
+/// private MultitouchSupport calls are not a TCC service.)
 func motorCheck() -> String? {
     if motor != nil { return nil }
-    guard createList != nil, getID != nil, isBuiltIn != nil, actuatorCreate != nil, actuatorOpen != nil,
+    guard createList != nil, getID != nil, actuatorCreate != nil, actuatorOpen != nil,
           actuationCreate != nil, actuationPlay != nil else {
         return "This version of macOS doesn't have the trackpad functions thockpad needs."
     }
@@ -107,7 +114,6 @@ func motorCheck() -> String? {
     for d in ids.sorted(by: { $0.builtIn && !$1.builtIn }) {
         if let ref = actuatorCreate!(d.id)?.takeRetainedValue(), actuatorOpen!(ref) == 0 {
             motorDeviceID = d.id
-            motorBuiltIn = d.builtIn
             motor = ref
             motorPointer = Unmanaged.passUnretained(ref as AnyObject).toOpaque()
             return nil
@@ -122,151 +128,97 @@ func openMotorIfNeeded() {
     if motor == nil { motorProblem = motorCheck() }
 }
 
-// MARK: - The tap
+// MARK: - Listening: poll the key state
 
-var eventTap: CFMachPort?
-var tapSource: CFRunLoopSource?
-var tapRunning: Bool { eventTap != nil }
 var lastClickAt = -1.0
+var pollRunning = false
+let pollLock = NSLock()
 
-let tapCallback: CGEventTapCallBack = { _, type, event, _ in
-    // macOS disables a tap that takes too long in the callback: re-arm and carry on.
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
-        return Unmanaged.passUnretained(event)
-    }
-    guard !stopRequested, !paused else { return Unmanaged.passUnretained(event) }
+func startListeningIfNeeded() {
+    pollLock.lock(); defer { pollLock.unlock() }
+    guard !pollRunning else { return }
+    pollRunning = true
+    let thread = Thread { pollKeys() }
+    thread.qualityOfService = .userInitiated
+    thread.name = "thockpad-poll"
+    thread.start()
+}
 
-    let t = now()
-    switch type {
-    case .keyDown, .flagsChanged:
-        if t - lastClickAt < throttleSeconds {
-            statsLock.lock(); stats.throttled += 1; statsLock.unlock()
-            return passThrough ? Unmanaged.passUnretained(event) : nil
+var listening: Bool { pollLock.lock(); defer { pollLock.unlock() }; return pollRunning }
+
+/// Read every key's state 500× a second, click on the edges. 128 boolean queries per pass costs ~2.7 % of
+/// one M1 core (top, idle); measured, not hoped (a probe tracked live typing on this Mac with transitions
+/// matching keystroke-for-keystroke, and saw injected System Events keys with no permission granted).
+func pollKeys() {
+    var keyState = [Bool](repeating: false, count: 128)
+    // Snapshot current state first so keys already held when thockpad starts don't fire phantom clicks,
+    // and their release doesn't fire a tock.
+    for code in 0..<128 { keyState[code] = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code)) }
+    while !stopRequested {
+        for code in 0..<128 {
+            let down = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code))
+            if down == keyState[code] { continue }
+            keyState[code] = down
+            guard !paused else { continue }        // paused: keep tracking state, just never click
+            if down {
+                let t = now()
+                if t - lastClickAt < throttleSeconds {
+                    statsLock.lock(); stats.throttled += 1; statsLock.unlock()
+                } else {
+                    lastClickAt = t
+                    if verbose { report("↓ \(keyName(code))") }
+                    let word: String? = talkEnabled
+                        ? (code == spaceCode ? wordBank.randomElement() : code == returnCode ? finishers.randomElement() : nil)
+                        : nil
+                    enqueue(Click(tones: clickTones(for: code, at: t), level: gain, word: word))
+                    statsLock.lock()
+                    if stats.first < 0 { stats.first = t }
+                    if stats.last > 0, t - stats.last < 1.0 { stats.active += t - stats.last }
+                    stats.last = t
+                    stats.lastKey = keyName(code)
+                    stats.lastKeyAt = t
+                    stats.down += 1
+                    statsLock.unlock()
+                }
+            } else {
+                let tones = releaseTones()
+                guard !tones.isEmpty else { continue }
+                if verbose { report("↑") }
+                enqueue(Click(tones: tones, level: gain * Float(currentProfile.release)))
+                statsLock.lock(); stats.up += 1; statsLock.unlock()
+            }
         }
-        lastClickAt = t
-        let code = Int(event.getIntegerValueField(.keyboardEventKeycode))
-        if verbose { report("↓ \(keyName(code))") }
-        let word: String? = talkEnabled
-            ? (code == spaceCode ? wordBank.randomElement() : code == returnCode ? finishers.randomElement() : nil)
-            : nil
-        enqueue(Click(tones: clickTones(for: code, at: t), level: gain, word: word))
-        statsLock.lock()
-        if stats.first < 0 { stats.first = t }
-        if stats.last > 0, t - stats.last < 1.0 { stats.active += t - stats.last }
-        stats.last = t
-        stats.down += 1
-        statsLock.unlock()
-        return passThrough ? Unmanaged.passUnretained(event) : nil
-
-    case .keyUp:
-        // Never swallow a release: a lost key-up leaves keys and modifiers stuck down.
-        let tones = releaseTones()
-        guard !tones.isEmpty else { return Unmanaged.passUnretained(event) }
-        if verbose { report("↑") }
-        enqueue(Click(tones: tones, level: gain * Float(currentProfile.release)))
-        statsLock.lock(); stats.up += 1; statsLock.unlock()
-        return Unmanaged.passUnretained(event)
-
-    default:
-        return Unmanaged.passUnretained(event)
+        usleep(2_000)
     }
 }
 
-/// Create the tap, add it to this thread's run loop (its callback fires from there), and enable it.
-func startTap() -> Bool {
-    guard eventTap == nil else { return true }
-    let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
-    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                      options: passThrough ? .listenOnly : .defaultTap,
-                                      eventsOfInterest: mask, callback: tapCallback, userInfo: nil) else {
-        return false
-    }
-    eventTap = tap
-    tapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-    CFRunLoopAddSource(CFRunLoopGetMain(), tapSource, .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    return true
-}
+// MARK: - Running (CLI)
 
-func stopTap() {
-    guard let tap = eventTap else { return }
-    CGEvent.tapEnable(tap: tap, enable: false)
-    if let source = tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
-    eventTap = nil
-    tapSource = nil
-}
-
-// MARK: - Input Monitoring
-
-func inputMonitoringGranted() -> Bool { AXIsProcessTrusted() }
-
-func openInputMonitoringPane() {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    task.arguments = ["x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"]
-    try? task.run()
-}
-
-/// Exit with instructions unless macOS already trusts this binary (CLI path; the GUI shows the same text in
-/// its window instead). A fresh grant only applies to a new process, so the current one is useless.
-func requireInputMonitoring() {
-    if inputMonitoringGranted() { return }
-    let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-    _ = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
-    report("""
-
-      thockpad can't hear your keyboard yet.
-
-        1. System Settings → Privacy & Security → Input Monitoring
-        2. switch thockpad on  (if it's not in the list, start it once from a terminal and try again)
-        3. start thockpad again — a brand-new grant only applies to a new process
-
-      If it's in the list, ticked, and still not working: the binary changed since you ticked it
-      (a rebuild, or a different copy). Run ./scripts/permissions.sh to give it a stable identity.
-    """)
-    openInputMonitoringPane()
-    exit(77)
-}
-
-// MARK: - Status
-
+/// `kill -USR1 <pid>` and the end of a run: how you're doing, in three lines.
 func printStatus() {
     statsLock.lock(); let s = stats; statsLock.unlock()
     let rate = s.active > 0 ? Double(s.down) / s.active : 0
     report("""
-    thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(talkEnabled ? " · talking" : "")\(passThrough ? "" : " · SWALLOWING KEYS")\(paused ? " · PAUSED" : "")
+    thockpad · “\(profileName)” (\(currentProfile.blurb)) · level \(String(format: "%.2f", gain))\(talkEnabled ? " · talking" : "")\(paused ? " · PAUSED" : "")
     \(s.down) presses, \(s.up) releases, \(s.throttled) too fast, \(s.spoken) words · \(String(format: "%.1f", rate)) keys/second
     ctrl-c stops it (or kill -USR1 \(getpid()) prints this).
     """)
 }
 
-// MARK: - Running (CLI)
-
 func runThockpad() -> Int32 {
     openMotorIfNeeded()
     if let problem = motorProblem { report("thockpad: \(problem)"); return 2 }
-    requireInputMonitoring()
     warmVoice()   // synthesise the word bank up front, so the first space bar is not slow
-
-    guard startTap() else {
-        report("thockpad couldn't open the keyboard tap. Quit any other thockpad and start it again; if that fails, ./scripts/permissions.sh")
-        return 1
-    }
     startClickWorkerIfNeeded()
+    startListeningIfNeeded()
     installExitSignals()
 
     // Silent by design: no click, no greeting — you will hear it when you type.
-    if chatter {
-        report("thockpad: “\(profileName)” — \(currentProfile.blurb). Ctrl-C stops.")
-        report(passThrough ? "  keys pass through to the Mac (--swallow to mute your real typing)."
-                           : "  keys are SWALLOWED — nothing you type reaches the Mac. Ctrl-C takes the keyboard back.")
-    }
+    if chatter { report("thockpad: “\(profileName)” — \(currentProfile.blurb). Type. Ctrl-C stops.") }
 
-    // Pump this thread's run loop: the event tap's callback fires from it, so a plain sleep loop here means
-    // the tap never delivers a single key (silent, zero presses — it looks like the tap is dead). Short
-    // slices so ctrl-c, which only sets a flag in the handler, ends it promptly.
-    while !stopRequested { CFRunLoopRunInMode(.defaultMode, 0.05, false) }
+    // The poller and the worker are their own threads; the main thread just waits. (A run loop was only
+    // ever needed for the event tap, which is gone.)
+    while !stopRequested { usleep(50_000) }
     printStatus()
     if let motor { _ = actuatorClose?(motor) }
     return 0
@@ -274,8 +226,7 @@ func runThockpad() -> Int32 {
 
 // MARK: - Timed run (for testing)
 
-/// Stop after N seconds — what `--run 20` uses: start thockpad, drive it from another process (or real
-/// fingers), and it reports its stats and exits on its own.
+/// Stop after N seconds — what `--run 20` uses.
 func startTimer(_ seconds: Double) {
     Thread {
         let end = now() + seconds
@@ -286,38 +237,49 @@ func startTimer(_ seconds: Double) {
 
 // MARK: - Self-test
 
-/// Without waiting for a human: post one synthetic key press and check it comes back through the tap and
-/// clicks. A trusted process can't see its own events at the HID tap but can at the session tap — which is
-/// also why thockpad listens at the session tap.
-func selfTest() -> Int32 {
+/// Start everything and prove the loop is alive. thockpad no longer injects or intercepts anything, so
+/// --selftest doesn't either: it starts listening, waits, and reports whether ANY key state changed.
+/// `--selftest --post-keys` (opt-in) additionally posts a space + delete pair through the HID system —
+/// they cancel out in any text field — to prove the poll sees even synthetic keys.
+func selfTest(postKeys: Bool = false) -> Int32 {
     openMotorIfNeeded()
     if let problem = motorProblem { report("self-test: \(problem)"); return 2 }
-    if !inputMonitoringGranted() {
-        report("self-test: not trusted yet — allow thockpad under Input Monitoring, then run it again (exit 3).")
-        return 3
-    }
-    guard startTap() else { report("self-test: trusted, but the tap wouldn't open (exit 3)."); return 3 }
     startClickWorkerIfNeeded()
+    startListeningIfNeeded()
 
     statsLock.lock(); let before = stats.down; statsLock.unlock()
-    let src = CGEventSource(stateID: .privateState)
-    if let down = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(spaceCode), keyDown: true) {
-        down.post(tap: .cgSessionEventTap)
+    if postKeys {
+        Thread {
+            usleep(300_000)
+            let src = CGEventSource(stateID: .combinedSessionState)
+            CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(spaceCode), keyDown: true)?.post(tap: .cghidEventTap)
+            usleep(60_000)
+            CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(spaceCode), keyDown: false)?.post(tap: .cghidEventTap)
+            usleep(30_000)
+            CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(deleteCode), keyDown: true)?.post(tap: .cghidEventTap)
+            usleep(60_000)
+            CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(deleteCode), keyDown: false)?.post(tap: .cghidEventTap)
+        }.start()
     }
-    let deadline = now() + 1.5
+    report("self-test: listening — press a key now (2 s)…")
+    let deadline = now() + 2
+    var sawKey = false
     while now() < deadline {
-        statsLock.lock(); let seen = stats.down > before; statsLock.unlock()
-        if seen { break }
-        CFRunLoopRunInMode(.defaultMode, 0.02, false)
+        statsLock.lock(); sawKey = stats.down > before; statsLock.unlock()
+        if sawKey { break }
+        usleep(20_000)
     }
     statsLock.lock(); let seen = stats.down > before; statsLock.unlock()
+    stopRequested = true
+    if let motor { _ = actuatorClose?(motor) }
     if seen {
-        report("self-test: OK — heard a synthetic space, clicked the trackpad (you should have felt/heard one click).")
-        if let motor { _ = actuatorClose?(motor) }
+        report("self-test: OK — heard a key press and clicked the trackpad.")
         return 0
     }
-    report("self-test: FAILED — trusted and tapping, but the synthetic key never came back. Type a key while `thockpad --verbose` runs to see what your Mac delivers.")
-    return 5
+    report(postKeys
+        ? "self-test: listening, but the synthetic keys never registered — tell the developer, this one's interesting."
+        : "self-test: listening (motor open, poller running) — no key arrived in 2 s. Type and retry; it will click.")
+    return seen ? 0 : 4
 }
 
 // MARK: - Signals
