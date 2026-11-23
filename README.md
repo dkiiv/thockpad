@@ -9,13 +9,13 @@ can make *sounds*, not just clicks. thockpad uses that as an engine: no sample f
 device. One or two sine tones, a few milliseconds each, straight to the motor.
 
 ```
-        ┌────────────┐  key state 2 ms  ┌────────────┐   MultitouchSupport   ┌─────────┐
-keys ──▶│ your Mac   │────────────────▶│ thockpad   │──────────────────────▶│ motor   │──▶ thock
-        └────────────┘  polls, no tap  │ 15 ms gate │   2 tones / click     └─────────┘
+        ┌────────────┐  key state ~6 ms ┌────────────┐   MultitouchSupport   ┌─────────┐
+keys ──▶│ your Mac   │─────────────────▶│ thockpad   │──────────────────────▶│ motor   │──▶ thock
+        └────────────┘  polls, no tap   │drvr budget │   2 tones / click     └─────────┘
 ```
 
-**thockpad needs no permissions at all.** It reads Apple's key-state API (`CGEventSource.keyState`) 500× a
-second and clicks on the edges — that query is not Input Monitoring, so nothing to allow in System
+**thockpad needs no permissions at all.** It reads Apple's key-state API (`CGEventSource.keyState`) and
+clicks on the edges — that query is not Input Monitoring, so nothing to allow in System
 Settings, nothing that can break between rebuilds, nothing that touches your keystrokes. Install and type.
 
 ## Download
@@ -66,9 +66,19 @@ The same engine without a window, for scripts and testing:
 ./build/nospeaker "hello"                 # the parent project: the trackpad talks
 ```
 
-Ctrl-C stops the CLI; `kill -USR1 <pid>` prints how you're doing (presses, releases, keys/second).
+Ctrl-C stops the CLI; `kill -USR1 <pid>` prints how you're doing (keys heard, clicks played, and why any
+were dropped).
 Both modes start **silently**: no startup sound, no terminal chatter unless you ask for it.
 Flags override saved GUI settings; without flags the binary opens the app.
+
+## If it misbehaves
+
+| symptom                       | cause and fix                                                                                              |
+|-------------------------------|------------------------------------------------------------------------------------------------------------|
+| **every key thocks twice**    | two engines running — the usual cause is keeping both the downloaded `Thockpad.app` and a `build/` copy. Only one launches per bundle now (a second launch wakes the first), so check for a stale copy in `/Applications` **and** `~/Downloads`, and quit them all. |
+| **a burst of thocks after the app sat idle, or when you open its window** | the machine slept or the process was frozen; those keys are history, not keystrokes, and clicks over 80 ms late are dropped. Thockpad now runs with App Nap disabled, which is what used to cause it. |
+| **some keys silent while typing very fast** | that's the sound budget, not the listener: the window/menu counts `heard`, `clicked` and `refused` separately, so if `heard` matches your keystrokes the keyboard side is fine and the motor was simply still busy. A quieter profile (`red`, `click`) has a shorter click and allows a faster rate. |
+| **no sound at all**           | the menu says `not listening` → press *Restart thockpad*. If it says a motor can't be found, that's a trackpad without Force Touch. Otherwise: mute the Mac and put it on a table — the sound is tiny and comes out of the glass. |
 
 ## How a click is made
 
@@ -91,14 +101,17 @@ stretch, because big keys sound bigger. A key-up adds a quieter, lower "tock".
 
 Two engineering notes:
 
-- **15 ms floor.** The motor can't mix two actuations, and nospeaker restarts it per call. A press within
-  15 ms of the previous *press* is dropped rather than queued (the queue itself is capped at 3 clicks) —
-  holding a key or pasting a paragraph stays in time and never backs up.
+- **The motor has a budget.** One click is ONE actuation (all tones in one dictionary, like nospeaker's
+  formants) and costs ~4 ms of driver time; the driver wants 15 ms between actuations, so ~66 clicks a
+  second — more than any typing. Presses faster than that overlap and the later click truncates the earlier
+  tail, the way a real board blurs at speed. What a click must never do is queue: a click over 80 ms old is
+  dropped, because late sound reads as the app making noise on its own.
 - **Watching, not tapping.** `CGEventSource.keyState` answers "is this key down right now?" for every
   physical key without Input Monitoring, and it can't interfere with typing — thockpad only reads state.
-  Polling all 128 keycodes every 2 ms costs a few percent of one M1 core and tracks keystrokes edge for
-  edge (measured: 9 synthetic keystrokes → 9 presses heard → 8 motor actuations, the miss being the 15 ms
-  floor; the poll probe tracked live typing keystroke-for-keystroke).
+  Measured on this M1: the 128 queries cost ~0.00 ms, but *waiting* is the floor — macOS sleeps never wake
+  faster than ~5.8 ms whatever you ask for, so the loop really runs ~170 passes a second (not the 500 the
+  first version's comments claimed), about 1 % of one core, and still 6–30× faster than the 30–100 ms a key
+  is held. The window says what it's doing: keys heard, clicks played, and why any were dropped.
 
 ## The fork
 
@@ -128,9 +141,10 @@ publishes it to Releases).
 
 ```
 MacBook Pro 14" (MacBookPro18,3)  M1 Pro  macOS 27.0.1  app clicks keystrokes with zero permissions ✓
-poller                            9 injected keystrokes → 9 presses heard → 8 motor actuations ✓ (15 ms floor)
-                                  ~2.7 % CPU idle-polling 128 keys every 2 ms
-the app (window + menu bar)       close → menu bar, Try a click ✓, Exit ✓
+poll loop                         ~170 passes/s (5.8 ms kernel sleep floor), ~1 % of one core ✓
+the app (window + menu bar)       close → menu bar, Try a click ✓, Exit ✓; second launch wakes the
+                                  first instead of stacking a second engine ✓
+App Nap                           NSAppSleepDisabled + .latencyCritical (a napped poller = silent keys) ✓
 settings you change               persist to disk and reload ✓
 nospeaker (upstream show)         still builds and talks from the split engine ✓
 Input Monitoring                  not needed, not asked for, not in the code anymore
